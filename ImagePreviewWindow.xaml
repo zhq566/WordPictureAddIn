@@ -18,6 +18,80 @@
         MouseWheel="Window_MouseWheel"
         MouseMove="Window_MouseMove">
     <Window.Resources>
+        <!-- 透明预览棋盘格画刷 -->
+        <DrawingBrush x:Key="CheckerboardBrush" TileMode="Tile" Viewport="0,0,16,16" ViewportUnits="Absolute">
+            <DrawingBrush.Drawing>
+                <DrawingGroup>
+                    <GeometryDrawing Brush="#FFFFFF">
+                        <GeometryDrawing.Geometry>
+                            <RectangleGeometry Rect="0,0,16,16"/>
+                        </GeometryDrawing.Geometry>
+                    </GeometryDrawing>
+                    <GeometryDrawing Brush="#CCCCCC">
+                        <GeometryDrawing.Geometry>
+                            <GeometryGroup>
+                                <RectangleGeometry Rect="0,0,8,8"/>
+                                <RectangleGeometry Rect="8,8,8,8"/>
+                            </GeometryGroup>
+                        </GeometryDrawing.Geometry>
+                    </GeometryDrawing>
+                </DrawingGroup>
+            </DrawingBrush.Drawing>
+        </DrawingBrush>
+
+        <!-- 色板中的预设颜色块 -->
+        <Style x:Key="SwatchButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="34"/>
+            <Setter Property="Height" Value="34"/>
+            <Setter Property="Margin" Value="3"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="SwatchBorder"
+                                CornerRadius="8"
+                                BorderBrush="#D0D4DA"
+                                BorderThickness="1"
+                                Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="SwatchBorder" Property="BorderBrush" Value="#4B5563"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 工具栏普通按钮（背景底色按钮等复用） -->
+        <Style x:Key="ToolActionButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="46"/>
+            <Setter Property="Height" Value="38"/>
+            <Setter Property="Margin" Value="2,0"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="ButtonBorder" Background="Transparent" CornerRadius="10">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="Background" Value="#EEF1F4"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="Background" Value="#E7EEF9"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <Style x:Key="ToolToggleStyle" TargetType="ToggleButton">
             <Setter Property="Width" Value="46"/>
             <Setter Property="Height" Value="38"/>
@@ -100,6 +174,9 @@
                         <TranslateTransform x:Name="ContentTranslateTransform" X="0" Y="0"/>
                     </TransformGroup>
                 </Canvas.RenderTransform>
+                <Rectangle x:Name="ImageBackdrop"
+                           IsHitTestVisible="False"
+                           Fill="#C7EDCC"/>
                 <Image x:Name="PreviewImage"
                        Stretch="Fill"/>
                 <Canvas x:Name="AnnotationCanvas"
@@ -279,6 +356,30 @@
                         </Grid>
                     </Button>
 
+                    <Button x:Name="BackgroundColorButton"
+                            Style="{StaticResource ToolActionButtonStyle}"
+                            Click="BackgroundColorButton_Click"
+                            ToolTip="预览底色">
+                        <Grid Width="22" Height="22">
+                            <Rectangle x:Name="BackgroundColorPreview"
+                                       Width="18"
+                                       Height="18"
+                                       RadiusX="3"
+                                       RadiusY="3"
+                                       Fill="#C7EDCC"
+                                       Stroke="#9AA0A6"
+                                       StrokeThickness="1"/>
+                            <Path Stroke="#FFFFFF"
+                                  StrokeThickness="1.6"
+                                  StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round"
+                                  HorizontalAlignment="Right"
+                                  VerticalAlignment="Bottom"
+                                  Margin="0,0,1,1"
+                                  Data="M0,0 L6,0 M3,0 L3,6"/>
+                        </Grid>
+                    </Button>
+
                     <Button x:Name="SaveButton"
                             Width="46"
                             Height="38"
@@ -313,6 +414,85 @@
                 </StackPanel>
             </Grid>
         </Border>
+
+        <Popup x:Name="BackgroundColorPopup"
+               Panel.ZIndex="25"
+               Placement="Top"
+               PlacementTarget="{Binding ElementName=BackgroundColorButton}"
+               StaysOpen="False"
+               AllowsTransparency="True">
+            <Border Margin="0,0,0,10"
+                    Padding="12,10"
+                    CornerRadius="16"
+                    Background="#FAFFFFFF"
+                    BorderBrush="#E7EAF0"
+                    BorderThickness="1">
+                <StackPanel>
+                    <TextBlock Text="预览底色"
+                               Margin="4,0,4,6"
+                               FontFamily="Microsoft YaHei UI"
+                               FontSize="12"
+                               Foreground="#6B7280"/>
+                    <WrapPanel Width="200" Orientation="Horizontal">
+                        <Button Style="{StaticResource SwatchButtonStyle}"
+                                Background="#C7EDCC"
+                                Tag="#C7EDCC"
+                                ToolTip="豆沙绿"
+                                Click="BackgroundSwatch_Click"/>
+                        <Button Style="{StaticResource SwatchButtonStyle}"
+                                Background="#FFFFFF"
+                                Tag="#FFFFFF"
+                                ToolTip="白色"
+                                Click="BackgroundSwatch_Click"/>
+                        <Button Style="{StaticResource SwatchButtonStyle}"
+                                Background="#E5E5E5"
+                                Tag="#E5E5E5"
+                                ToolTip="浅灰"
+                                Click="BackgroundSwatch_Click"/>
+                        <Button Style="{StaticResource SwatchButtonStyle}"
+                                Background="#000000"
+                                Tag="#000000"
+                                ToolTip="黑色"
+                                Click="BackgroundSwatch_Click"/>
+                        <Button Style="{StaticResource SwatchButtonStyle}"
+                                Background="{StaticResource CheckerboardBrush}"
+                                Tag="Transparent"
+                                ToolTip="透明（棋盘格）"
+                                Click="BackgroundSwatch_Click"/>
+                    </WrapPanel>
+                    <Button Margin="3,8,3,0"
+                            Height="30"
+                            Click="CustomBackgroundColorButton_Click"
+                            Cursor="Hand"
+                            Background="Transparent"
+                            BorderThickness="0">
+                        <Button.Template>
+                            <ControlTemplate TargetType="Button">
+                                <Border x:Name="ButtonBorder"
+                                        BorderBrush="#E1E4E8"
+                                        BorderThickness="1"
+                                        CornerRadius="8"
+                                        Background="Transparent">
+                                    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsMouseOver" Value="True">
+                                        <Setter TargetName="ButtonBorder" Property="Background" Value="#EEF1F4"/>
+                                    </Trigger>
+                                    <Trigger Property="IsPressed" Value="True">
+                                        <Setter TargetName="ButtonBorder" Property="Background" Value="#E7EEF9"/>
+                                    </Trigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </Button.Template>
+                        <TextBlock Text="自定义…"
+                                   FontFamily="Microsoft YaHei UI"
+                                   FontSize="12"
+                                   Foreground="#374151"/>
+                    </Button>
+                </StackPanel>
+            </Border>
+        </Popup>
 
         <Canvas x:Name="CursorOverlay"
                 Panel.ZIndex="30"

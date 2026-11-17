@@ -8,6 +8,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
 using Microsoft.Win32;
+using WordPictureAddIn.Properties;
 using DrawingBitmap = System.Drawing.Bitmap;
 using DrawingImage = System.Drawing.Image;
 
@@ -17,6 +18,8 @@ namespace WordPictureAddIn
     {
         private const double ZoomStepFactor = 1.06d;
         private const double AnnotationStrokeThickness = 3.0d;
+        private const string DefaultBackgroundColor = "#C7EDCC";
+        private const string TransparentBackgroundColor = "Transparent";
 
         private DrawingBitmap _bitmap;
         private double _baseImageWidth;
@@ -47,12 +50,13 @@ namespace WordPictureAddIn
             SizeChanged += ImagePreviewWindow_SizeChanged;
             Deactivated += ImagePreviewWindow_Deactivated;
             UpdateCursorVisual();
+            ApplyBackgroundColor(LoadSavedBackgroundColor());
         }
 
         public void SetImage(DrawingImage image)
         {
             var old = _bitmap;
-            _bitmap = new DrawingBitmap(image);
+            _bitmap = EnsureArgbBitmap(image);
             if (old != null)
             {
                 old.Dispose();
@@ -80,6 +84,46 @@ namespace WordPictureAddIn
             WindowState = WindowState.Maximized;
             ClearAnnotations();
             ResetImageLayout();
+        }
+
+        /// <summary>
+        /// 统一转换为 32bppArgb 位图，确保 PNG 等格式的透明通道不会在复制过程中丢失。
+        /// </summary>
+        private static DrawingBitmap EnsureArgbBitmap(DrawingImage image)
+        {
+            if (image == null)
+            {
+                return null;
+            }
+
+            var source = image as DrawingBitmap;
+            if (source != null &&
+                source.PixelFormat == System.Drawing.Imaging.PixelFormat.Format32bppArgb)
+            {
+                return new DrawingBitmap(source);
+            }
+
+            var bitmap = new DrawingBitmap(
+                image.Width,
+                image.Height,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+
+            using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
+            {
+                graphics.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+                graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+                graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                graphics.DrawImage(
+                    image,
+                    new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height),
+                    0,
+                    0,
+                    image.Width,
+                    image.Height,
+                    System.Drawing.GraphicsUnit.Pixel);
+            }
+
+            return bitmap;
         }
 
         private void ImagePreviewWindow_Loaded(object sender, RoutedEventArgs e)
@@ -174,6 +218,172 @@ namespace WordPictureAddIn
             CommitOrCancelTextEditing();
             ClearToolSelection();
             RestoreInitialView();
+        }
+
+        private void BackgroundColorButton_Click(object sender, RoutedEventArgs e)
+        {
+            CommitOrCancelTextEditing();
+            BackgroundColorPopup.IsOpen = true;
+        }
+
+        private void BackgroundSwatch_Click(object sender, RoutedEventArgs e)
+        {
+            var button = sender as Button;
+            if (button == null)
+            {
+                return;
+            }
+
+            var color = button.Tag as string;
+            if (string.IsNullOrWhiteSpace(color))
+            {
+                return;
+            }
+
+            ApplyBackgroundColor(color);
+            SaveBackgroundColor(color);
+            BackgroundColorPopup.IsOpen = false;
+            Activate();
+        }
+
+        private void CustomBackgroundColorButton_Click(object sender, RoutedEventArgs e)
+        {
+            BackgroundColorPopup.IsOpen = false;
+            CommitOrCancelTextEditing();
+
+            _suspendAutoHide = true;
+            try
+            {
+                using (var dialog = new System.Windows.Forms.ColorDialog
+                {
+                    AllowFullOpen = true,
+                    FullOpen = true,
+                    AnyColor = true,
+                    Color = ToDrawingColor(ImageBackdrop.Fill)
+                })
+                {
+                    var helper = new System.Windows.Interop.WindowInteropHelper(this);
+                    var result = dialog.ShowDialog(new NativeWindowOwner(helper.Handle));
+                    if (result != System.Windows.Forms.DialogResult.OK)
+                    {
+                        return;
+                    }
+
+                    var color = string.Format("#{0:X2}{1:X2}{2:X2}", dialog.Color.R, dialog.Color.G, dialog.Color.B);
+                    ApplyBackgroundColor(color);
+                    SaveBackgroundColor(color);
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                _suspendAutoHide = false;
+                Activate();
+            }
+        }
+
+        private void ApplyBackgroundColor(string colorText)
+        {
+            if (string.IsNullOrWhiteSpace(colorText))
+            {
+                colorText = DefaultBackgroundColor;
+            }
+
+            var fill = CreateBackgroundBrush(colorText);
+            ImageBackdrop.Fill = fill;
+            UpdateBackgroundColorPreview(fill);
+        }
+
+        private static Brush CreateBackgroundBrush(string colorText)
+        {
+            if (string.Equals(colorText, TransparentBackgroundColor, StringComparison.OrdinalIgnoreCase))
+            {
+                return Brushes.Transparent;
+            }
+
+            var color = ParseColor(colorText) ?? ParseColor(DefaultBackgroundColor).Value;
+            var brush = new SolidColorBrush(color);
+            brush.Freeze();
+            return brush;
+        }
+
+        private static Color? ParseColor(string colorText)
+        {
+            if (string.IsNullOrWhiteSpace(colorText))
+            {
+                return null;
+            }
+
+            try
+            {
+                var converted = ColorConverter.ConvertFromString(colorText.Trim());
+                if (converted is Color)
+                {
+                    return (Color)converted;
+                }
+            }
+            catch (FormatException)
+            {
+            }
+            catch (NotSupportedException)
+            {
+            }
+
+            return null;
+        }
+
+        private void UpdateBackgroundColorPreview(Brush fill)
+        {
+            var solid = fill as SolidColorBrush;
+            if (solid == null || solid.Color.A == 0)
+            {
+                // 透明时用棋盘格图标表示
+                BackgroundColorPreview.Fill = TryFindResource("CheckerboardBrush") as Brush;
+                return;
+            }
+
+            var preview = new SolidColorBrush(solid.Color);
+            preview.Freeze();
+            BackgroundColorPreview.Fill = preview;
+        }
+
+        private static System.Drawing.Color ToDrawingColor(Brush brush)
+        {
+            var solid = brush as SolidColorBrush;
+            if (solid == null || solid.Color.A == 0)
+            {
+                return System.Drawing.Color.Empty;
+            }
+
+            var color = solid.Color;
+            return System.Drawing.Color.FromArgb(color.R, color.G, color.B);
+        }
+
+        private static string LoadSavedBackgroundColor()
+        {
+            try
+            {
+                var saved = Settings.Default.PreviewBackgroundColor;
+                return string.IsNullOrWhiteSpace(saved) ? DefaultBackgroundColor : saved;
+            }
+            catch
+            {
+                return DefaultBackgroundColor;
+            }
+        }
+
+        private static void SaveBackgroundColor(string colorText)
+        {
+            try
+            {
+                Settings.Default.PreviewBackgroundColor = colorText;
+                Settings.Default.Save();
+            }
+            catch
+            {
+            }
         }
 
         private void SaveButton_Click(object sender, RoutedEventArgs e)
@@ -567,6 +777,8 @@ namespace WordPictureAddIn
             _baseImageHeight = _bitmap.Height * _zoom;
             PreviewImage.Width = _baseImageWidth;
             PreviewImage.Height = _baseImageHeight;
+            ImageBackdrop.Width = _baseImageWidth;
+            ImageBackdrop.Height = _baseImageHeight;
             AnnotationCanvas.Width = _baseImageWidth;
             AnnotationCanvas.Height = _baseImageHeight;
             ContentCanvas.Width = _baseImageWidth;
@@ -1103,6 +1315,25 @@ namespace WordPictureAddIn
             Ellipse,
             Arrow,
             Text
+        }
+
+        /// <summary>
+        /// 把预览窗口句柄包装成 IWin32Window，使颜色对话框以预览窗口为 owner，
+        /// 避免被 Topmost 的预览窗口遮挡。
+        /// </summary>
+        private sealed class NativeWindowOwner : System.Windows.Forms.IWin32Window
+        {
+            private readonly IntPtr _handle;
+
+            public NativeWindowOwner(IntPtr handle)
+            {
+                _handle = handle;
+            }
+
+            public IntPtr Handle
+            {
+                get { return _handle; }
+            }
         }
     }
 }

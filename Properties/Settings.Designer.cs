@@ -22,5 +22,17 @@ namespace WordPictureAddIn.Properties {
                 return defaultInstance;
             }
         }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("#C7EDCC")]
+        public string PreviewBackgroundColor {
+            get {
+                return ((string)(this["PreviewBackgroundColor"]));
+            }
+            set {
+                this["PreviewBackgroundColor"] = value;
+            }
+        }
     }
 }

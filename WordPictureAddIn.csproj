@@ -263,7 +263,7 @@
     <ManifestKeyFile>WordPictureAddIn_TemporaryKey.pfx</ManifestKeyFile>
   </PropertyGroup>
   <PropertyGroup>
-    <ManifestCertificateThumbprint>97DF36344DCFA30EEAE802ACF14482896D3EF7F5</ManifestCertificateThumbprint>
+    <ManifestCertificateThumbprint>9A613A9DF525B6C5635582F9D6B5016622B32757</ManifestCertificateThumbprint>
   </PropertyGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <!-- Include additional build rules for an Office application add-in. -->
