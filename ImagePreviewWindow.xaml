@@ -178,7 +178,8 @@
                            IsHitTestVisible="False"
                            Fill="#C7EDCC"/>
                 <Image x:Name="PreviewImage"
-                       Stretch="Fill"/>
+                       Stretch="Fill"
+                       RenderOptions.BitmapScalingMode="HighQuality"/>
                 <Canvas x:Name="AnnotationCanvas"
                         Panel.ZIndex="5"
                         Background="Transparent"

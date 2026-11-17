@@ -14,22 +14,33 @@ namespace WordPictureAddIn
 {
     public partial class ThisAddIn
     {
+        private const double SelectionCaptureDelayMilliseconds = 260.0d;
+
         private ImagePreviewWindow _previewWindow;
         private string _cachedSelectionKey;
         private Image _cachedSelectionImage;
+        private System.Windows.Threading.DispatcherTimer _selectionCaptureTimer;
+        private string _pendingSelectionKey;
+        private string _previewSelectionKey;
+        private bool _isShuttingDown;
 
         private void ThisAddIn_Startup(object sender, EventArgs e)
         {
+            _isShuttingDown = false;
             EnsureWpfApplication();
-            EnsurePreviewWindow();
             Application.WindowSelectionChange += Application_WindowSelectionChange;
             Application.WindowBeforeDoubleClick += Application_WindowBeforeDoubleClick;
+            SchedulePreviewWindowPrewarm();
         }
 
         private void ThisAddIn_Shutdown(object sender, EventArgs e)
         {
+            _isShuttingDown = true;
+
             Application.WindowSelectionChange -= Application_WindowSelectionChange;
             Application.WindowBeforeDoubleClick -= Application_WindowBeforeDoubleClick;
+
+            CancelPendingSelectionCapture();
 
             if (_previewWindow != null)
             {
@@ -42,10 +53,73 @@ namespace WordPictureAddIn
 
         private void Application_WindowSelectionChange(Selection selection)
         {
-            string selectionKey;
-            if (!TryGetSelectionKey(selection, out selectionKey))
+            try
             {
-                ClearCachedSelectionImage();
+                string selectionKey;
+                if (!TryGetSelectionKey(selection, out selectionKey))
+                {
+                    CancelPendingSelectionCapture();
+                    ClearCachedSelectionImage();
+                    return;
+                }
+
+                if (selectionKey == _cachedSelectionKey && _cachedSelectionImage != null)
+                {
+                    CancelPendingSelectionCapture();
+                    return;
+                }
+
+                // 选中图片时不再同步截图：Word 序列化 WordOpenXML 的开销很大，
+                // 改为延迟防抖后预取，避免每次单击选中都阻塞 Word 界面线程。
+                ScheduleSelectionCapture(selectionKey);
+            }
+            catch
+            {
+            }
+        }
+
+        private void ScheduleSelectionCapture(string selectionKey)
+        {
+            _pendingSelectionKey = selectionKey;
+
+            var application = System.Windows.Application.Current;
+            if (application == null)
+            {
+                return;
+            }
+
+            if (_selectionCaptureTimer == null)
+            {
+                _selectionCaptureTimer = new System.Windows.Threading.DispatcherTimer(
+                    System.Windows.Threading.DispatcherPriority.Background,
+                    application.Dispatcher)
+                {
+                    Interval = TimeSpan.FromMilliseconds(SelectionCaptureDelayMilliseconds)
+                };
+                _selectionCaptureTimer.Tick += SelectionCaptureTimer_Tick;
+            }
+
+            _selectionCaptureTimer.Stop();
+            _selectionCaptureTimer.Start();
+        }
+
+        private void CancelPendingSelectionCapture()
+        {
+            _pendingSelectionKey = null;
+
+            if (_selectionCaptureTimer != null)
+            {
+                _selectionCaptureTimer.Stop();
+            }
+        }
+
+        private void SelectionCaptureTimer_Tick(object sender, EventArgs e)
+        {
+            var selectionKey = _pendingSelectionKey;
+            CancelPendingSelectionCapture();
+
+            if (string.IsNullOrEmpty(selectionKey))
+            {
                 return;
             }
 
@@ -54,14 +128,27 @@ namespace WordPictureAddIn
                 return;
             }
 
-            var image = CaptureSelectionImage(selection);
-            if (image == null)
+            try
             {
-                ClearCachedSelectionImage();
-                return;
-            }
+                var selection = Application.Selection;
 
-            ReplaceCachedSelectionImage(selectionKey, image);
+                string currentKey;
+                if (!TryGetSelectionKey(selection, out currentKey) || currentKey != selectionKey)
+                {
+                    return;
+                }
+
+                var image = CaptureSelectionImage(selection);
+                if (image == null)
+                {
+                    return;
+                }
+
+                ReplaceCachedSelectionImage(selectionKey, image);
+            }
+            catch
+            {
+            }
         }
 
         private void Application_WindowBeforeDoubleClick(Selection selection, ref bool cancel)
@@ -74,13 +161,16 @@ namespace WordPictureAddIn
                     return;
                 }
 
-                var image = TryGetCachedSelectionImage(selectionKey) ?? CaptureSelectionImage(selection);
+                // 即将打开预览：取消可能仍在排队的预取，避免重复截图。
+                CancelPendingSelectionCapture();
+
+                var image = TryTakeCachedSelectionImage(selectionKey) ?? CaptureSelectionImage(selection);
                 if (image == null)
                 {
                     return;
                 }
 
-                ShowPreview(image);
+                ShowPreview(image, selectionKey);
             }
             catch
             {
@@ -174,18 +264,21 @@ namespace WordPictureAddIn
                 {
                     flatOpcXml = selection.InlineShapes[1].Range.WordOpenXML as string;
                 }
-
-                if (string.IsNullOrWhiteSpace(flatOpcXml) &&
-                    selection.ShapeRange != null &&
-                    selection.ShapeRange.Count > 0)
+                else if (selection.ShapeRange != null && selection.ShapeRange.Count > 0)
                 {
                     var shape = selection.ShapeRange[1];
                     expectedShapeName = shape.Name;
 
-                    var anchorRange = shape.Anchor;
-                    if (anchorRange != null)
+                    // 浮动图片优先取选区范围（只含锚定段落，通常比整段 XML 小）。
+                    flatOpcXml = selection.Range.WordOpenXML as string;
+
+                    if (string.IsNullOrWhiteSpace(flatOpcXml))
                     {
-                        flatOpcXml = anchorRange.WordOpenXML as string;
+                        var anchorRange = shape.Anchor;
+                        if (anchorRange != null)
+                        {
+                            flatOpcXml = anchorRange.WordOpenXML as string;
+                        }
                     }
                 }
 
@@ -204,43 +297,28 @@ namespace WordPictureAddIn
 
         private static Image ParseOriginalImageFromFlatOpc(string flatOpcXml, string expectedShapeName)
         {
-            var packageDocument = new XmlDocument();
-            packageDocument.PreserveWhitespace = false;
-            packageDocument.XmlResolver = null;
-            packageDocument.LoadXml(flatOpcXml);
+            string embedId;
+            double cropLeft, cropTop, cropRight, cropBottom;
 
-            var packageNamespaceManager = CreatePackageNamespaceManager(packageDocument.NameTable);
-
-            var documentPart = FindPackagePart(packageDocument, packageNamespaceManager, DocumentPartName);
-            var documentRoot = GetPartXmlRoot(documentPart);
-            if (documentRoot == null)
+            if (!TryReadPictureBlipFromFlatOpc(
+                    flatOpcXml,
+                    expectedShapeName,
+                    out embedId,
+                    out cropLeft,
+                    out cropTop,
+                    out cropRight,
+                    out cropBottom))
             {
                 return null;
             }
 
-            var drawingNamespaceManager = CreateDrawingNamespaceManager(documentRoot.OwnerDocument.NameTable);
-
-            var blip = FindPictureBlipElement(documentRoot, drawingNamespaceManager, expectedShapeName);
-            if (blip == null)
-            {
-                return null;
-            }
-
-            var embedId = blip.GetAttribute("embed", RelationshipsNamespaceUri);
-            if (string.IsNullOrWhiteSpace(embedId))
-            {
-                return null;
-            }
-
-            var imagePartName = ResolveRelationshipTarget(packageDocument, packageNamespaceManager, embedId);
+            var imagePartName = ResolveRelationshipTarget(flatOpcXml, embedId);
             if (string.IsNullOrWhiteSpace(imagePartName) || !IsSupportedBitmapPart(imagePartName))
             {
                 return null;
             }
 
-            var imageBytes = ReadBinaryPartData(
-                FindPackagePart(packageDocument, packageNamespaceManager, imagePartName));
-
+            var imageBytes = ReadBinaryPartData(flatOpcXml, imagePartName);
             if (imageBytes == null || imageBytes.Length == 0)
             {
                 return null;
@@ -252,222 +330,305 @@ namespace WordPictureAddIn
                 return null;
             }
 
-            double cropLeft, cropTop, cropRight, cropBottom;
-            ReadSourceRectangle(blip, out cropLeft, out cropTop, out cropRight, out cropBottom);
-
             return CropBitmapBySourceRectangle(bitmap, cropLeft, cropTop, cropRight, cropBottom);
         }
 
-        private static XmlNamespaceManager CreatePackageNamespaceManager(XmlNameTable nameTable)
+        private static XmlReader CreateFlatOpcReader(string flatOpcXml)
         {
-            var namespaceManager = new XmlNamespaceManager(nameTable);
-            namespaceManager.AddNamespace("pkg", PackageNamespaceUri);
-            return namespaceManager;
+            var settings = new XmlReaderSettings
+            {
+                CloseInput = true,
+                IgnoreComments = true,
+                IgnoreProcessingInstructions = true,
+                IgnoreWhitespace = true,
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null
+            };
+
+            return XmlReader.Create(new StringReader(flatOpcXml), settings);
         }
 
-        private static XmlNamespaceManager CreateDrawingNamespaceManager(XmlNameTable nameTable)
+        private static string ReadPartName(XmlReader reader)
         {
-            var namespaceManager = new XmlNamespaceManager(nameTable);
-            namespaceManager.AddNamespace("a", DrawingNamespaceUri);
-            namespaceManager.AddNamespace("r", RelationshipsNamespaceUri);
-            namespaceManager.AddNamespace("wp", WordprocessingDrawingNamespaceUri);
-            namespaceManager.AddNamespace("pkg", PackageNamespaceUri);
-            return namespaceManager;
+            var name = reader.GetAttribute("name", PackageNamespaceUri);
+            if (string.IsNullOrEmpty(name))
+            {
+                name = reader.GetAttribute("name");
+            }
+
+            return name;
         }
 
-        private static XmlElement FindPackagePart(
-            XmlDocument packageDocument,
-            XmlNamespaceManager packageNamespaceManager,
-            string partName)
+        /// <summary>
+        /// 流式扫描扁平 OPC，定位图片的 a:blip 引用及裁剪设置（a:srcRect）。
+        /// 只深入 /word/document.xml，其余 part 整段跳过，不构建 DOM。
+        /// </summary>
+        private static bool TryReadPictureBlipFromFlatOpc(
+            string flatOpcXml,
+            string expectedShapeName,
+            out string embedId,
+            out double left,
+            out double top,
+            out double right,
+            out double bottom)
         {
-            if (packageDocument == null || string.IsNullOrWhiteSpace(partName))
+            embedId = null;
+            left = 0d;
+            top = 0d;
+            right = 0d;
+            bottom = 0d;
+
+            var fallbackEmbedId = (string)null;
+            double fallbackLeft = 0d, fallbackTop = 0d, fallbackRight = 0d, fallbackBottom = 0d;
+            var hasFallback = false;
+
+            using (var reader = CreateFlatOpcReader(flatOpcXml))
+            {
+                var inDocumentPart = false;
+                var anchorDepth = -1;
+                var currentDocPrName = (string)null;
+                var currentEmbedId = (string)null;
+                double currentLeft = 0d, currentTop = 0d, currentRight = 0d, currentBottom = 0d;
+                var skipRead = false;
+
+                while (skipRead || reader.Read())
+                {
+                    skipRead = false;
+
+                    if (reader.NodeType == XmlNodeType.Element &&
+                        reader.LocalName == "part" &&
+                        reader.NamespaceURI == PackageNamespaceUri)
+                    {
+                        inDocumentPart = string.Equals(
+                            ReadPartName(reader),
+                            DocumentPartName,
+                            StringComparison.OrdinalIgnoreCase);
+
+                        if (!inDocumentPart && !reader.IsEmptyElement)
+                        {
+                            // 与图片无关的 part（含大块 Base64 媒体数据）整段跳过。
+                            reader.Skip();
+                            skipRead = reader.NodeType != XmlNodeType.None;
+                        }
+
+                        continue;
+                    }
+
+                    if (!inDocumentPart)
+                    {
+                        continue;
+                    }
+
+                    if (reader.NodeType == XmlNodeType.Element)
+                    {
+                        if (anchorDepth < 0 &&
+                            (reader.LocalName == "anchor" || reader.LocalName == "inline") &&
+                            reader.NamespaceURI == WordprocessingDrawingNamespaceUri)
+                        {
+                            anchorDepth = reader.Depth;
+                            currentDocPrName = null;
+                            currentEmbedId = null;
+                            currentLeft = 0d;
+                            currentTop = 0d;
+                            currentRight = 0d;
+                            currentBottom = 0d;
+                            continue;
+                        }
+
+                        if (anchorDepth < 0)
+                        {
+                            continue;
+                        }
+
+                        if (reader.LocalName == "docPr" &&
+                            reader.NamespaceURI == WordprocessingDrawingNamespaceUri)
+                        {
+                            currentDocPrName = reader.GetAttribute("name");
+                        }
+                        else if (reader.LocalName == "blip" &&
+                                 reader.NamespaceURI == DrawingNamespaceUri)
+                        {
+                            var candidate = reader.GetAttribute("embed", RelationshipsNamespaceUri);
+                            if (!string.IsNullOrEmpty(candidate))
+                            {
+                                currentEmbedId = candidate;
+                            }
+                        }
+                        else if (reader.LocalName == "srcRect" &&
+                                 reader.NamespaceURI == DrawingNamespaceUri)
+                        {
+                            currentLeft = ReadPercentageAttribute(reader, "l");
+                            currentTop = ReadPercentageAttribute(reader, "t");
+                            currentRight = ReadPercentageAttribute(reader, "r");
+                            currentBottom = ReadPercentageAttribute(reader, "b");
+                        }
+
+                        continue;
+                    }
+
+                    if (reader.NodeType == XmlNodeType.EndElement &&
+                        anchorDepth >= 0 &&
+                        reader.Depth == anchorDepth &&
+                        (reader.LocalName == "anchor" || reader.LocalName == "inline"))
+                    {
+                        anchorDepth = -1;
+
+                        if (string.IsNullOrEmpty(currentEmbedId))
+                        {
+                            continue;
+                        }
+
+                        if (!hasFallback)
+                        {
+                            fallbackEmbedId = currentEmbedId;
+                            fallbackLeft = currentLeft;
+                            fallbackTop = currentTop;
+                            fallbackRight = currentRight;
+                            fallbackBottom = currentBottom;
+                            hasFallback = true;
+                        }
+
+                        if (string.IsNullOrEmpty(expectedShapeName) ||
+                            string.Equals(currentDocPrName, expectedShapeName, StringComparison.Ordinal))
+                        {
+                            embedId = currentEmbedId;
+                            left = currentLeft;
+                            top = currentTop;
+                            right = currentRight;
+                            bottom = currentBottom;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            if (!hasFallback)
+            {
+                return false;
+            }
+
+            // 名称对不上时（同一段落锚定多张浮动图片），退回第一张图片。
+            embedId = fallbackEmbedId;
+            left = fallbackLeft;
+            top = fallbackTop;
+            right = fallbackRight;
+            bottom = fallbackBottom;
+            return true;
+        }
+
+        private static string ResolveRelationshipTarget(string flatOpcXml, string relationshipId)
+        {
+            if (string.IsNullOrWhiteSpace(flatOpcXml) || string.IsNullOrWhiteSpace(relationshipId))
             {
                 return null;
             }
 
-            var parts = packageDocument.SelectNodes("/pkg:package/pkg:part", packageNamespaceManager);
-            if (parts == null)
+            using (var reader = CreateFlatOpcReader(flatOpcXml))
             {
-                return null;
-            }
+                var inRelationshipsPart = false;
+                var skipRead = false;
 
-            foreach (XmlNode node in parts)
-            {
-                var part = node as XmlElement;
-                if (part == null)
+                while (skipRead || reader.Read())
                 {
-                    continue;
-                }
+                    skipRead = false;
 
-                var name = part.GetAttribute("name", PackageNamespaceUri);
-                if (string.IsNullOrEmpty(name))
-                {
-                    name = part.GetAttribute("name");
-                }
+                    if (reader.NodeType == XmlNodeType.Element &&
+                        reader.LocalName == "part" &&
+                        reader.NamespaceURI == PackageNamespaceUri)
+                    {
+                        inRelationshipsPart = string.Equals(
+                            ReadPartName(reader),
+                            DocumentRelationshipsPartName,
+                            StringComparison.OrdinalIgnoreCase);
 
-                if (string.Equals(name, partName, StringComparison.OrdinalIgnoreCase))
-                {
-                    return part;
+                        if (!inRelationshipsPart && !reader.IsEmptyElement)
+                        {
+                            reader.Skip();
+                            skipRead = reader.NodeType != XmlNodeType.None;
+                        }
+
+                        continue;
+                    }
+
+                    if (!inRelationshipsPart ||
+                        reader.NodeType != XmlNodeType.Element ||
+                        !string.Equals(reader.LocalName, "Relationship", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    if (!string.Equals(reader.GetAttribute("Id"), relationshipId, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    if (string.Equals(reader.GetAttribute("TargetMode"), "External", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return null;
+                    }
+
+                    var target = reader.GetAttribute("Target");
+                    if (string.IsNullOrWhiteSpace(target))
+                    {
+                        return null;
+                    }
+
+                    return NormalizePartName("/word", target);
                 }
             }
 
             return null;
         }
 
-        private static XmlElement GetPartXmlRoot(XmlElement partElement)
+        private static byte[] ReadBinaryPartData(string flatOpcXml, string partName)
         {
-            if (partElement == null)
+            if (string.IsNullOrWhiteSpace(flatOpcXml) || string.IsNullOrWhiteSpace(partName))
             {
                 return null;
             }
 
-            foreach (XmlNode child in partElement.ChildNodes)
+            using (var reader = CreateFlatOpcReader(flatOpcXml))
             {
-                var xmlData = child as XmlElement;
-                if (xmlData == null || !string.Equals(xmlData.LocalName, "xmlData", StringComparison.Ordinal))
-                {
-                    continue;
-                }
+                var isTargetPart = false;
+                var skipRead = false;
 
-                foreach (XmlNode dataChild in xmlData.ChildNodes)
+                while (skipRead || reader.Read())
                 {
-                    var dataElement = dataChild as XmlElement;
-                    if (dataElement != null)
+                    skipRead = false;
+
+                    if (reader.NodeType == XmlNodeType.Element &&
+                        reader.LocalName == "part" &&
+                        reader.NamespaceURI == PackageNamespaceUri)
                     {
-                        return dataElement;
+                        isTargetPart = string.Equals(
+                            ReadPartName(reader),
+                            partName,
+                            StringComparison.OrdinalIgnoreCase);
+
+                        if (!isTargetPart && !reader.IsEmptyElement)
+                        {
+                            reader.Skip();
+                            skipRead = reader.NodeType != XmlNodeType.None;
+                        }
+
+                        continue;
                     }
-                }
-            }
 
-            return null;
-        }
-
-        private static byte[] ReadBinaryPartData(XmlElement partElement)
-        {
-            if (partElement == null)
-            {
-                return null;
-            }
-
-            foreach (XmlNode child in partElement.ChildNodes)
-            {
-                var binaryData = child as XmlElement;
-                if (binaryData == null ||
-                    !string.Equals(binaryData.LocalName, "binaryData", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                var base64Text = binaryData.InnerText;
-                if (string.IsNullOrWhiteSpace(base64Text))
-                {
-                    return null;
-                }
-
-                return Convert.FromBase64String(base64Text.Trim());
-            }
-
-            return null;
-        }
-
-        private static XmlElement FindPictureBlipElement(
-            XmlElement documentRoot,
-            XmlNamespaceManager namespaceManager,
-            string expectedShapeName)
-        {
-            if (documentRoot == null)
-            {
-                return null;
-            }
-
-            var anchors = documentRoot.SelectNodes(".//wp:anchor | .//wp:inline", namespaceManager);
-            if (anchors != null)
-            {
-                foreach (XmlNode node in anchors)
-                {
-                    var anchor = node as XmlElement;
-                    if (anchor == null)
+                    if (!isTargetPart ||
+                        reader.NodeType != XmlNodeType.Element ||
+                        !string.Equals(reader.LocalName, "binaryData", StringComparison.Ordinal))
                     {
                         continue;
                     }
 
-                    var blip = FindBlipInside(anchor, namespaceManager);
-                    if (blip == null)
+                    var base64Text = reader.ReadElementContentAsString();
+                    if (string.IsNullOrWhiteSpace(base64Text))
                     {
-                        continue;
+                        return null;
                     }
 
-                    if (string.IsNullOrEmpty(expectedShapeName))
-                    {
-                        return blip;
-                    }
-
-                    var docPr = anchor.SelectSingleNode(".//wp:docPr", namespaceManager) as XmlElement;
-                    if (docPr == null)
-                    {
-                        continue;
-                    }
-
-                    if (string.Equals(docPr.GetAttribute("name"), expectedShapeName, StringComparison.Ordinal))
-                    {
-                        return blip;
-                    }
+                    return Convert.FromBase64String(base64Text.Trim());
                 }
-            }
-
-            // 多个浮动图片锚定在同一段落时，名称可能对不上，退回到文档中第一个图片引用。
-            return documentRoot.SelectSingleNode(".//a:blip[@r:embed]", namespaceManager) as XmlElement;
-        }
-
-        private static XmlElement FindBlipInside(XmlElement container, XmlNamespaceManager namespaceManager)
-        {
-            if (container == null)
-            {
-                return null;
-            }
-
-            return container.SelectSingleNode(".//a:blip[@r:embed]", namespaceManager) as XmlElement;
-        }
-
-        private static string ResolveRelationshipTarget(
-            XmlDocument packageDocument,
-            XmlNamespaceManager packageNamespaceManager,
-            string relationshipId)
-        {
-            var relationshipsRoot = GetPartXmlRoot(
-                FindPackagePart(packageDocument, packageNamespaceManager, DocumentRelationshipsPartName));
-
-            if (relationshipsRoot == null)
-            {
-                return null;
-            }
-
-            foreach (XmlNode node in relationshipsRoot.ChildNodes)
-            {
-                var relationship = node as XmlElement;
-                if (relationship == null ||
-                    !string.Equals(relationship.LocalName, "Relationship", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                if (!string.Equals(relationship.GetAttribute("Id"), relationshipId, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                if (string.Equals(relationship.GetAttribute("TargetMode"), "External", StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-
-                var target = relationship.GetAttribute("Target");
-                if (string.IsNullOrWhiteSpace(target))
-                {
-                    return null;
-                }
-
-                return NormalizePartName("/word", target);
             }
 
             return null;
@@ -530,53 +691,14 @@ namespace WordPictureAddIn
         }
 
         /// <summary>
-        /// 读取图片裁剪设置（a:srcRect），返回值已换算为 0~1 的比例。
+        /// 读取 a:srcRect 的百分比属性（单位 1/100000），换算为 0~1 的比例。
         /// </summary>
-        private static void ReadSourceRectangle(
-            XmlElement blip,
-            out double left,
-            out double top,
-            out double right,
-            out double bottom)
-        {
-            left = 0d;
-            top = 0d;
-            right = 0d;
-            bottom = 0d;
-
-            var blipFill = blip == null ? null : blip.ParentNode as XmlElement;
-            if (blipFill == null)
-            {
-                return;
-            }
-
-            XmlElement sourceRectangle = null;
-            foreach (XmlNode child in blipFill.ChildNodes)
-            {
-                var element = child as XmlElement;
-                if (element != null && string.Equals(element.LocalName, "srcRect", StringComparison.Ordinal))
-                {
-                    sourceRectangle = element;
-                    break;
-                }
-            }
-
-            if (sourceRectangle == null)
-            {
-                return;
-            }
-
-            left = ReadPercentageAttribute(sourceRectangle, "l");
-            top = ReadPercentageAttribute(sourceRectangle, "t");
-            right = ReadPercentageAttribute(sourceRectangle, "r");
-            bottom = ReadPercentageAttribute(sourceRectangle, "b");
-        }
-
-        private static double ReadPercentageAttribute(XmlElement element, string attributeName)
+        private static double ReadPercentageAttribute(XmlReader reader, string attributeName)
         {
             double value;
-            if (!double.TryParse(
-                    element.GetAttribute(attributeName),
+            if (reader == null ||
+                !double.TryParse(
+                    reader.GetAttribute(attributeName),
                     NumberStyles.Float,
                     CultureInfo.InvariantCulture,
                     out value))
@@ -897,10 +1019,11 @@ namespace WordPictureAddIn
             }
         }
 
-        private void ShowPreview(Image image)
+        private void ShowPreview(Image image, string selectionKey)
         {
             EnsurePreviewWindow();
 
+            _previewSelectionKey = selectionKey;
             _previewWindow.SetImage(image);
 
             if (!_previewWindow.IsVisible)
@@ -915,14 +1038,21 @@ namespace WordPictureAddIn
             _previewWindow.Activate();
         }
 
-        private Image TryGetCachedSelectionImage(string selectionKey)
+        /// <summary>
+        /// 命中缓存时直接把位图所有权交给预览窗口，避免再复制一份整图数据。
+        /// 交出后缓存置空，防止后续 Dispose 到已被窗口使用的位图。
+        /// </summary>
+        private Image TryTakeCachedSelectionImage(string selectionKey)
         {
             if (_cachedSelectionImage == null || selectionKey != _cachedSelectionKey)
             {
                 return null;
             }
 
-            return new Bitmap(_cachedSelectionImage);
+            var image = _cachedSelectionImage;
+            _cachedSelectionImage = null;
+            _cachedSelectionKey = null;
+            return image;
         }
 
         private void ReplaceCachedSelectionImage(string selectionKey, Image image)
@@ -954,16 +1084,100 @@ namespace WordPictureAddIn
             }
         }
 
+        /// <summary>
+        /// Word 启动时同步创建 WPF 窗口会拖慢启动速度，改为界面空闲时预热。
+        /// </summary>
+        private void SchedulePreviewWindowPrewarm()
+        {
+            var application = System.Windows.Application.Current;
+            if (application == null)
+            {
+                return;
+            }
+
+            application.Dispatcher.BeginInvoke(
+            System.Windows.Threading.DispatcherPriority.ApplicationIdle,
+            new Action(delegate
+            {
+                if (_isShuttingDown)
+                {
+                    return;
+                }
+
+                try
+                {
+                    EnsurePreviewWindow();
+                }
+                catch
+                {
+                }
+            }));
+        }
+
+        private bool TryGetCurrentSelectionKey(out string selectionKey)
+        {
+            selectionKey = null;
+
+            if (_isShuttingDown)
+            {
+                return false;
+            }
+
+            try
+            {
+                return TryGetSelectionKey(Application.Selection, out selectionKey);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private void EnsurePreviewWindow()
         {
-            if (_previewWindow == null)
+            if (_previewWindow != null)
             {
-                _previewWindow = new ImagePreviewWindow();
-                _previewWindow.Closed += delegate
+                return;
+            }
+
+            var window = new ImagePreviewWindow();
+            _previewWindow = window;
+            window.Closed += delegate
+            {
+                // 预览窗口里的位图由 SetImage 移交所有权，关闭时取回。
+                // 若当前选区仍是刚才那张图，直接放回缓存，再次双击无需重新截图。
+                var bitmap = window.ReleaseBitmap();
+                if (bitmap != null)
+                {
+                    string currentKey;
+                    if (!_isShuttingDown &&
+                        _previewSelectionKey != null &&
+                        TryGetCurrentSelectionKey(out currentKey) &&
+                        currentKey == _previewSelectionKey)
+                    {
+                        ReplaceCachedSelectionImage(currentKey, bitmap);
+                    }
+                    else
+                    {
+                        bitmap.Dispose();
+                    }
+                }
+
+                _previewSelectionKey = null;
+
+                if (ReferenceEquals(_previewWindow, window))
                 {
                     _previewWindow = null;
-                };
-            }
+                }
+
+                if (_isShuttingDown)
+                {
+                    return;
+                }
+
+                // 关闭后再次空闲时预热新窗口，保证下一次双击依然能快速弹出。
+                SchedulePreviewWindowPrewarm();
+            };
         }
 
         #region VSTO 生成的代码

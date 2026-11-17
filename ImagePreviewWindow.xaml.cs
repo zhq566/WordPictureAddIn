@@ -21,6 +21,9 @@ namespace WordPictureAddIn
         private const string DefaultBackgroundColor = "#C7EDCC";
         private const string TransparentBackgroundColor = "Transparent";
 
+        /// <summary>显示用位图的最长边像素上限，超大图片会先降采样再交给 WPF。</summary>
+        private const int MaxDisplayPixelDimension = 4096;
+
         private DrawingBitmap _bitmap;
         private double _baseImageWidth;
         private double _baseImageHeight;
@@ -42,6 +45,10 @@ namespace WordPictureAddIn
         private TextBox _activeTextEditor;
         private bool _suspendAutoHide;
         private bool _isClosing;
+        private bool _layoutUpdatePending;
+        private int _interactionDepth;
+        private bool _fullScreenLayoutApplied;
+        private System.Windows.Threading.DispatcherTimer _interactionEndTimer;
 
         public ImagePreviewWindow()
         {
@@ -49,6 +56,7 @@ namespace WordPictureAddIn
             Loaded += ImagePreviewWindow_Loaded;
             SizeChanged += ImagePreviewWindow_SizeChanged;
             Deactivated += ImagePreviewWindow_Deactivated;
+            Closed += ImagePreviewWindow_Closed;
             UpdateCursorVisual();
             ApplyBackgroundColor(LoadSavedBackgroundColor());
         }
@@ -57,24 +65,38 @@ namespace WordPictureAddIn
         {
             var old = _bitmap;
             _bitmap = EnsureArgbBitmap(image);
-            if (old != null)
+
+            // 传入的位图所有权已交给预览窗口；若转换产生了新位图，原始数据可立即释放。
+            if (image != null && !ReferenceEquals(image, _bitmap))
+            {
+                image.Dispose();
+            }
+
+            if (old != null && !ReferenceEquals(old, _bitmap))
             {
                 old.Dispose();
             }
 
-            using (var stream = new System.IO.MemoryStream())
-            {
-                _bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
-                stream.Position = 0;
+            // P1：不再做 PNG 编码再解码的往返，直接从像素缓冲区生成 BitmapSource。
+            // P2：超大图片按显示上限降采样，导出时仍使用 _bitmap 的全分辨率数据。
+            PreviewImage.Source = CreateDisplaySource(_bitmap);
 
-                var source = new BitmapImage();
-                source.BeginInit();
-                source.CacheOption = BitmapCacheOption.OnLoad;
-                source.StreamSource = stream;
-                source.EndInit();
-                source.Freeze();
-                PreviewImage.Source = source;
+            ApplyFullScreenLayout();
+            ClearAnnotations();
+            ResetImageLayout();
+        }
+
+        /// <summary>
+        /// 只在首次显示时设置一次窗口位置与状态，避免每次预览都触发多轮布局。
+        /// </summary>
+        private void ApplyFullScreenLayout()
+        {
+            if (_fullScreenLayoutApplied)
+            {
+                return;
             }
+
+            _fullScreenLayoutApplied = true;
 
             WindowState = WindowState.Normal;
             Left = SystemParameters.VirtualScreenLeft;
@@ -82,8 +104,6 @@ namespace WordPictureAddIn
             Width = SystemParameters.VirtualScreenWidth;
             Height = SystemParameters.VirtualScreenHeight;
             WindowState = WindowState.Maximized;
-            ClearAnnotations();
-            ResetImageLayout();
         }
 
         /// <summary>
@@ -100,7 +120,8 @@ namespace WordPictureAddIn
             if (source != null &&
                 source.PixelFormat == System.Drawing.Imaging.PixelFormat.Format32bppArgb)
             {
-                return new DrawingBitmap(source);
+                // 已经是目标格式：直接接管所有权，避免整图复制。
+                return source;
             }
 
             var bitmap = new DrawingBitmap(
@@ -121,22 +142,174 @@ namespace WordPictureAddIn
                     image.Width,
                     image.Height,
                     System.Drawing.GraphicsUnit.Pixel);
-            }
+           }
 
-            return bitmap;
-        }
+           return bitmap;
+       }
+
+       /// <summary>
+       /// 显示用位图源：超过显示上限的大图先降采样，减少 WPF 渲染与内存压力。
+       /// </summary>
+       private static BitmapSource CreateDisplaySource(DrawingBitmap bitmap)
+       {
+           if (bitmap == null)
+           {
+               return null;
+           }
+
+           var sourceBitmap = bitmap;
+           var ownsSourceBitmap = false;
+
+           try
+           {
+               var maxSide = Math.Max(bitmap.Width, bitmap.Height);
+               if (maxSide > MaxDisplayPixelDimension)
+               {
+                   var ratio = (double)MaxDisplayPixelDimension / maxSide;
+                   var narrowWidth = Math.Max(1, (int)Math.Round(bitmap.Width * ratio));
+                   var narrowHeight = Math.Max(1, (int)Math.Round(bitmap.Height * ratio));
+
+                   var scaled = new DrawingBitmap(
+                       narrowWidth,
+                       narrowHeight,
+                       System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+
+                   try
+                   {
+                       using (var graphics = System.Drawing.Graphics.FromImage(scaled))
+                       {
+                           graphics.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+                           graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                           graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                           graphics.DrawImage(
+                               bitmap,
+                               new System.Drawing.Rectangle(0, 0, narrowWidth, narrowHeight),
+                               0,
+                               0,
+                               bitmap.Width,
+                               bitmap.Height,
+                               System.Drawing.GraphicsUnit.Pixel);
+                       }
+                   }
+                   catch
+                   {
+                       scaled.Dispose();
+                       throw;
+                   }
+
+                   sourceBitmap = scaled;
+                   ownsSourceBitmap = true;
+               }
+
+               return CreateBitmapSource(sourceBitmap);
+           }
+           finally
+           {
+               if (ownsSourceBitmap)
+               {
+                   sourceBitmap.Dispose();
+               }
+           }
+       }
+
+       /// <summary>
+       /// 直接用 LockBits 的像素缓冲区生成 Bgra32 的 BitmapSource，省掉 PNG 编解码。
+       /// </summary>
+       private static BitmapSource CreateBitmapSource(DrawingBitmap bitmap)
+       {
+           var bounds = new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height);
+           var data = bitmap.LockBits(
+               bounds,
+               System.Drawing.Imaging.ImageLockMode.ReadOnly,
+               System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+
+           try
+           {
+               var source = BitmapSource.Create(
+                   bitmap.Width,
+                   bitmap.Height,
+                   96.0d,
+                   96.0d,
+                   PixelFormats.Bgra32,
+                   null,
+                   data.Scan0,
+                   data.Stride * bitmap.Height,
+                   data.Stride);
+
+               source.Freeze();
+               return source;
+           }
+           finally
+           {
+               bitmap.UnlockBits(data);
+           }
+       }
 
         private void ImagePreviewWindow_Loaded(object sender, RoutedEventArgs e)
         {
-            ResetImageLayout();
+            RequestImageLayoutUpdate();
         }
 
         private void ImagePreviewWindow_SizeChanged(object sender, SizeChangedEventArgs e)
         {
+            if (e.NewSize.Width <= 0 || e.NewSize.Height <= 0)
+            {
+                return;
+            }
+
+            if (e.NewSize.Width == e.PreviousSize.Width && e.NewSize.Height == e.PreviousSize.Height)
+            {
+                return;
+            }
+
             if (!_draggingImage)
             {
-                ResetImageLayout();
+                // 最大化过程的 SizeChanged 可能连续触发多次，合并成一次布局。
+                RequestImageLayoutUpdate();
             }
+        }
+
+        /// <summary>
+        /// 把同一帧内的多次布局请求合并成一次，避免重复的 ResetImageLayout。
+        /// </summary>
+        private void RequestImageLayoutUpdate()
+        {
+            if (_layoutUpdatePending)
+            {
+                return;
+            }
+
+            _layoutUpdatePending = true;
+            Dispatcher.BeginInvoke(
+                System.Windows.Threading.DispatcherPriority.Background,
+                new Action(delegate
+                {
+                    _layoutUpdatePending = false;
+                    ResetImageLayout();
+                }));
+        }
+
+        private void ImagePreviewWindow_Closed(object sender, EventArgs e)
+        {
+            if (_interactionEndTimer != null)
+            {
+                _interactionEndTimer.Stop();
+                _interactionEndTimer.Tick -= InteractionEndTimer_Tick;
+                _interactionEndTimer = null;
+            }
+
+            PreviewImage.Source = null;
+            // 位图所有权属于调用方，这里只断开引用，由调用方通过 ReleaseBitmap 取回。
+        }
+
+        /// <summary>
+        /// 关闭窗口时把位图交还给调用方，供再次预览时复用缓存，避免重复截图。
+        /// </summary>
+        public DrawingBitmap ReleaseBitmap()
+        {
+            var bitmap = _bitmap;
+            _bitmap = null;
+            return bitmap;
         }
 
         private void ImagePreviewWindow_Deactivated(object sender, EventArgs e)
@@ -650,8 +823,67 @@ namespace WordPictureAddIn
             }
 
             var factor = e.Delta > 0 ? ZoomStepFactor : 1.0d / ZoomStepFactor;
+            BeginImageInteraction();
             ChangeZoom(factor, e.GetPosition(ImageCanvas));
+            EndImageInteraction();
             e.Handled = true;
+        }
+
+        /// <summary>
+        /// 缩放/拖拽期间临时降低位图缩放质量，交互结束后恢复，减轻全屏分层窗口的渲染压力。
+        /// </summary>
+        private void BeginImageInteraction()
+        {
+            _interactionDepth++;
+            if (_interactionDepth == 1)
+            {
+                RenderOptions.SetBitmapScalingMode(PreviewImage, BitmapScalingMode.LowQuality);
+            }
+
+            if (_interactionEndTimer == null)
+            {
+                _interactionEndTimer = new System.Windows.Threading.DispatcherTimer(
+                    System.Windows.Threading.DispatcherPriority.Background,
+                    Dispatcher)
+                {
+                    Interval = TimeSpan.FromMilliseconds(140)
+                };
+                _interactionEndTimer.Tick += InteractionEndTimer_Tick;
+            }
+
+            _interactionEndTimer.Stop();
+            _interactionEndTimer.Start();
+        }
+
+        private void EndImageInteraction()
+        {
+            if (_interactionDepth > 0)
+            {
+                _interactionDepth--;
+            }
+        }
+
+        /// <summary>
+        /// 交互持续进行时（如长距离拖拽）刷新计时器，避免中途恢复高质量渲染。
+        /// </summary>
+        private void ExtendImageInteraction()
+        {
+            if (_interactionEndTimer != null && _interactionDepth > 0)
+            {
+                _interactionEndTimer.Stop();
+                _interactionEndTimer.Start();
+            }
+        }
+
+        private void InteractionEndTimer_Tick(object sender, EventArgs e)
+        {
+            if (_interactionEndTimer != null)
+            {
+                _interactionEndTimer.Stop();
+            }
+
+            _interactionDepth = 0;
+            RenderOptions.SetBitmapScalingMode(PreviewImage, BitmapScalingMode.HighQuality);
         }
 
         private void PreviewImage_MouseWheel(object sender, MouseWheelEventArgs e)
@@ -670,6 +902,7 @@ namespace WordPictureAddIn
             _dragStart = e.GetPosition(ImageCanvas);
             _dragOriginX = ContentTranslateTransform.X;
             _dragOriginY = ContentTranslateTransform.Y;
+            BeginImageInteraction();
             ContentCanvas.CaptureMouse();
             e.Handled = true;
         }
@@ -685,10 +918,16 @@ namespace WordPictureAddIn
             ContentTranslateTransform.X = _dragOriginX + (point.X - _dragStart.X);
             ContentTranslateTransform.Y = _dragOriginY + (point.Y - _dragStart.Y);
             ClampTranslation();
+            ExtendImageInteraction();
         }
 
         private void PreviewImage_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
+            if (_draggingImage)
+            {
+                EndImageInteraction();
+            }
+
             _draggingImage = false;
             ContentCanvas.ReleaseMouseCapture();
             e.Handled = true;
