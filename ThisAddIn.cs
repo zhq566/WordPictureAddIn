@@ -16,12 +16,16 @@ namespace WordPictureAddIn
     {
         private const double SelectionCaptureDelayMilliseconds = 260.0d;
 
-        private ImagePreviewWindow _previewWindow;
+        /// <summary>已贴出的贴图窗口，可同时存在多个。</summary>
+        private readonly List<ImagePreviewWindow> _pinWindows = new List<ImagePreviewWindow>();
+
+        /// <summary>预先创建好的空闲贴图窗口，下次双击时直接复用，省去构造开销。</summary>
+        private ImagePreviewWindow _sparePinWindow;
+
         private string _cachedSelectionKey;
         private Image _cachedSelectionImage;
         private System.Windows.Threading.DispatcherTimer _selectionCaptureTimer;
         private string _pendingSelectionKey;
-        private string _previewSelectionKey;
         private bool _isShuttingDown;
 
         private void ThisAddIn_Startup(object sender, EventArgs e)
@@ -42,12 +46,7 @@ namespace WordPictureAddIn
 
             CancelPendingSelectionCapture();
 
-            if (_previewWindow != null)
-            {
-                _previewWindow.Close();
-                _previewWindow = null;
-            }
-
+            CloseAllPinWindows();
             ClearCachedSelectionImage();
         }
 
@@ -161,16 +160,28 @@ namespace WordPictureAddIn
                     return;
                 }
 
-                // 即将打开预览：取消可能仍在排队的预取，避免重复截图。
+                // 即将贴图：取消可能仍在排队的预取，避免重复截图。
                 CancelPendingSelectionCapture();
 
-                var image = TryTakeCachedSelectionImage(selectionKey) ?? CaptureSelectionImage(selection);
+                var image = TryCloneCachedSelectionImage(selectionKey);
                 if (image == null)
                 {
-                    return;
+                    image = CaptureSelectionImage(selection);
+                    if (image == null)
+                    {
+                        return;
+                    }
+
+                    // 先存入缓存，之后同一选区再次贴图可以直接克隆，无需重新截图。
+                    ReplaceCachedSelectionImage(selectionKey, image);
+                    image = TryCloneCachedSelectionImage(selectionKey);
+                    if (image == null)
+                    {
+                        return;
+                    }
                 }
 
-                ShowPreview(image, selectionKey);
+                ShowPin(image);
             }
             catch
             {
@@ -1019,40 +1030,64 @@ namespace WordPictureAddIn
             }
         }
 
-        private void ShowPreview(Image image, string selectionKey)
+        /// <summary>
+        /// 把图片贴到屏幕上。位图所有权移交给新窗口，窗口关闭时自行释放。
+        /// </summary>
+        private void ShowPin(Image image)
         {
-            EnsurePreviewWindow();
+            var window = TakeSparePinWindow();
 
-            _previewSelectionKey = selectionKey;
-            _previewWindow.SetImage(image);
-
-            if (!_previewWindow.IsVisible)
+            try
             {
-                _previewWindow.Show();
+                window.SetImage(image);
             }
-            else
+            catch
             {
-                _previewWindow.Activate();
+                try
+                {
+                    window.Close();
+                }
+                catch
+                {
+                }
+
+                image.Dispose();
+                throw;
             }
 
-            _previewWindow.Activate();
+            _pinWindows.Add(window);
+
+            window.Show();
+            window.Activate();
+
+            // 空闲时再预热一个备用窗口，保证下一次双击依然能立刻弹出。
+            SchedulePreviewWindowPrewarm();
         }
 
         /// <summary>
-        /// 命中缓存时直接把位图所有权交给预览窗口，避免再复制一份整图数据。
-        /// 交出后缓存置空，防止后续 Dispose 到已被窗口使用的位图。
+        /// 命中缓存时克隆一份位图交给贴图窗口，缓存继续保留以便重复贴同一张图。
         /// </summary>
-        private Image TryTakeCachedSelectionImage(string selectionKey)
+        private Image TryCloneCachedSelectionImage(string selectionKey)
         {
             if (_cachedSelectionImage == null || selectionKey != _cachedSelectionKey)
             {
                 return null;
             }
 
-            var image = _cachedSelectionImage;
-            _cachedSelectionImage = null;
-            _cachedSelectionKey = null;
-            return image;
+            try
+            {
+                var source = _cachedSelectionImage as Bitmap;
+                var copy = source != null
+                    ? source.Clone(new System.Drawing.Rectangle(0, 0, source.Width, source.Height), PixelFormat.Format32bppArgb)
+                    : new Bitmap(_cachedSelectionImage);
+
+                copy.SetResolution(96f, 96f);
+                return copy;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private void ReplaceCachedSelectionImage(string selectionKey, Image image)
@@ -1104,9 +1139,14 @@ namespace WordPictureAddIn
                     return;
                 }
 
+                if (_sparePinWindow != null)
+                {
+                    return;
+                }
+
                 try
                 {
-                    EnsurePreviewWindow();
+                    _sparePinWindow = CreatePinWindow();
                 }
                 catch
                 {
@@ -1114,70 +1154,84 @@ namespace WordPictureAddIn
             }));
         }
 
-        private bool TryGetCurrentSelectionKey(out string selectionKey)
+        private ImagePreviewWindow CreatePinWindow()
         {
-            selectionKey = null;
-
-            if (_isShuttingDown)
-            {
-                return false;
-            }
-
-            try
-            {
-                return TryGetSelectionKey(Application.Selection, out selectionKey);
-            }
-            catch
-            {
-                return false;
-            }
+            var window = new ImagePreviewWindow();
+            window.Closed += PinWindow_Closed;
+            return window;
         }
 
-        private void EnsurePreviewWindow()
+        private ImagePreviewWindow TakeSparePinWindow()
         {
-            if (_previewWindow != null)
+            var window = _sparePinWindow;
+            if (window != null)
+            {
+                _sparePinWindow = null;
+                return window;
+            }
+
+            return CreatePinWindow();
+        }
+
+        private void PinWindow_Closed(object sender, EventArgs e)
+        {
+            var window = sender as ImagePreviewWindow;
+            if (window == null)
             {
                 return;
             }
 
-            var window = new ImagePreviewWindow();
-            _previewWindow = window;
-            window.Closed += delegate
+            window.Closed -= PinWindow_Closed;
+            _pinWindows.Remove(window);
+
+            if (ReferenceEquals(_sparePinWindow, window))
             {
-                // 预览窗口里的位图由 SetImage 移交所有权，关闭时取回。
-                // 若当前选区仍是刚才那张图，直接放回缓存，再次双击无需重新截图。
-                var bitmap = window.ReleaseBitmap();
-                if (bitmap != null)
+                _sparePinWindow = null;
+            }
+
+            if (_isShuttingDown)
+            {
+                return;
+            }
+
+            // 关闭后再次空闲时预热新的备用窗口。
+            SchedulePreviewWindowPrewarm();
+        }
+
+        private void CloseAllPinWindows()
+        {
+            _isShuttingDown = true;
+
+            ImagePreviewWindow spare;
+            while (_pinWindows.Count > 0)
+            {
+                var window = _pinWindows[_pinWindows.Count - 1];
+                _pinWindows.RemoveAt(_pinWindows.Count - 1);
+
+                try
                 {
-                    string currentKey;
-                    if (!_isShuttingDown &&
-                        _previewSelectionKey != null &&
-                        TryGetCurrentSelectionKey(out currentKey) &&
-                        currentKey == _previewSelectionKey)
-                    {
-                        ReplaceCachedSelectionImage(currentKey, bitmap);
-                    }
-                    else
-                    {
-                        bitmap.Dispose();
-                    }
+                    window.Closed -= PinWindow_Closed;
+                    window.Close();
                 }
-
-                _previewSelectionKey = null;
-
-                if (ReferenceEquals(_previewWindow, window))
+                catch
                 {
-                    _previewWindow = null;
                 }
+            }
 
-                if (_isShuttingDown)
+            spare = _sparePinWindow;
+            _sparePinWindow = null;
+
+            if (spare != null)
+            {
+                try
                 {
-                    return;
+                    spare.Closed -= PinWindow_Closed;
+                    spare.Close();
                 }
-
-                // 关闭后再次空闲时预热新窗口，保证下一次双击依然能快速弹出。
-                SchedulePreviewWindowPrewarm();
-            };
+                catch
+                {
+                }
+            }
         }
 
         #region VSTO 生成的代码

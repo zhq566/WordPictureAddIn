@@ -7,6 +7,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 using Microsoft.Win32;
 using WordPictureAddIn.Properties;
 using DrawingBitmap = System.Drawing.Bitmap;
@@ -14,28 +15,44 @@ using DrawingImage = System.Drawing.Image;
 
 namespace WordPictureAddIn
 {
+    /// <summary>
+    /// 贴图窗口：按图片原始像素尺寸贴在屏幕上（超过工作区则等比缩小），
+    /// 可拖动移动、滚轮缩放，失去焦点不关闭，悬停显示工具栏。
+    /// </summary>
     public partial class ImagePreviewWindow : Window
     {
-        private const double ZoomStepFactor = 1.06d;
+        private const double ZoomStepFactor = 1.1d;
+        private const double MinZoom = 0.1d;
+        private const double MaxZoom = 8.0d;
         private const double AnnotationStrokeThickness = 3.0d;
         private const string DefaultBackgroundColor = "#C7EDCC";
         private const string TransparentBackgroundColor = "Transparent";
+
+        /// <summary>图片外围留给阴影的边距（DIP）。</summary>
+        private const double ShadowMargin = 10.0d;
+
+        /// <summary>贴图本体边框的描边宽度（DIP），与 XAML 中 RootBorder 保持一致。</summary>
+        private const double PinBorderThickness = 1.0d;
+
+        /// <summary>窗口左上角到图片左上角的偏移（阴影边距 + 描边）。</summary>
+        private const double ContentOffset = ShadowMargin + PinBorderThickness;
+
+        /// <summary>贴图最大占工作区的比例，超出时等比缩小。</summary>
+        private const double MaxWorkspaceRatio = 0.9d;
+
+        private const int ToolbarHideDelayMilliseconds = 320;
 
         /// <summary>显示用位图的最长边像素上限，超大图片会先降采样再交给 WPF。</summary>
         private const int MaxDisplayPixelDimension = 4096;
 
         private DrawingBitmap _bitmap;
+        private bool _ownsBitmap;
+
+        /// <summary>缩放比例 1 时的图片尺寸（DIP），按物理像素 / DPI 缩放比换算。</summary>
         private double _baseImageWidth;
         private double _baseImageHeight;
         private double _zoom = 1.0d;
-        private double _initialScale = 1.0d;
-        private double _initialTranslateX;
-        private double _initialTranslateY;
-        private bool _draggingImage;
         private bool _drawingAnnotation;
-        private Point _dragStart;
-        private double _dragOriginX;
-        private double _dragOriginY;
         private Point _annotationStart;
         private Shape _previewShape;
         private Path _previewArrow;
@@ -43,74 +60,49 @@ namespace WordPictureAddIn
         private readonly List<UIElement> _annotationHistory = new List<UIElement>();
         private Grid _activeTextEditorContainer;
         private TextBox _activeTextEditor;
-        private bool _suspendAutoHide;
         private bool _isClosing;
-        private bool _layoutUpdatePending;
         private int _interactionDepth;
-        private bool _fullScreenLayoutApplied;
-        private System.Windows.Threading.DispatcherTimer _interactionEndTimer;
+        private bool _suppressToolbarRefresh;
+        private DispatcherTimer _interactionEndTimer;
+        private DispatcherTimer _toolbarHideTimer;
 
         public ImagePreviewWindow()
         {
             InitializeComponent();
-            Loaded += ImagePreviewWindow_Loaded;
-            SizeChanged += ImagePreviewWindow_SizeChanged;
-            Deactivated += ImagePreviewWindow_Deactivated;
-            Closed += ImagePreviewWindow_Closed;
             UpdateCursorVisual();
             ApplyBackgroundColor(LoadSavedBackgroundColor());
         }
 
+        /// <summary>
+        /// 交给窗口的位图所有权归窗口所有，关闭时自动释放。
+        /// </summary>
         public void SetImage(DrawingImage image)
         {
-            var old = _bitmap;
-            _bitmap = EnsureArgbBitmap(image);
+            ReleaseImage();
 
-            // 传入的位图所有权已交给预览窗口；若转换产生了新位图，原始数据可立即释放。
+            _bitmap = EnsureArgbBitmap(image, out _ownsBitmap);
+
+            // 传入的位图所有权已交给贴图窗口；若转换产生了新位图，原始数据可立即释放。
             if (image != null && !ReferenceEquals(image, _bitmap))
             {
                 image.Dispose();
-            }
-
-            if (old != null && !ReferenceEquals(old, _bitmap))
-            {
-                old.Dispose();
             }
 
             // P1：不再做 PNG 编码再解码的往返，直接从像素缓冲区生成 BitmapSource。
             // P2：超大图片按显示上限降采样，导出时仍使用 _bitmap 的全分辨率数据。
             PreviewImage.Source = CreateDisplaySource(_bitmap);
 
-            ApplyFullScreenLayout();
             ClearAnnotations();
-            ResetImageLayout();
-        }
-
-        /// <summary>
-        /// 只在首次显示时设置一次窗口位置与状态，避免每次预览都触发多轮布局。
-        /// </summary>
-        private void ApplyFullScreenLayout()
-        {
-            if (_fullScreenLayoutApplied)
-            {
-                return;
-            }
-
-            _fullScreenLayoutApplied = true;
-
-            WindowState = WindowState.Normal;
-            Left = SystemParameters.VirtualScreenLeft;
-            Top = SystemParameters.VirtualScreenTop;
-            Width = SystemParameters.VirtualScreenWidth;
-            Height = SystemParameters.VirtualScreenHeight;
-            WindowState = WindowState.Maximized;
+            ApplyPinLayout();
         }
 
         /// <summary>
         /// 统一转换为 32bppArgb 位图，确保 PNG 等格式的透明通道不会在复制过程中丢失。
         /// </summary>
-        private static DrawingBitmap EnsureArgbBitmap(DrawingImage image)
+        private static DrawingBitmap EnsureArgbBitmap(DrawingImage image, out bool ownsBitmap)
         {
+            ownsBitmap = true;
+
             if (image == null)
             {
                 return null;
@@ -128,6 +120,7 @@ namespace WordPictureAddIn
                 image.Width,
                 image.Height,
                 System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            bitmap.SetResolution(96f, 96f);
 
             using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
             {
@@ -142,187 +135,488 @@ namespace WordPictureAddIn
                     image.Width,
                     image.Height,
                     System.Drawing.GraphicsUnit.Pixel);
-           }
-
-           return bitmap;
-       }
-
-       /// <summary>
-       /// 显示用位图源：超过显示上限的大图先降采样，减少 WPF 渲染与内存压力。
-       /// </summary>
-       private static BitmapSource CreateDisplaySource(DrawingBitmap bitmap)
-       {
-           if (bitmap == null)
-           {
-               return null;
-           }
-
-           var sourceBitmap = bitmap;
-           var ownsSourceBitmap = false;
-
-           try
-           {
-               var maxSide = Math.Max(bitmap.Width, bitmap.Height);
-               if (maxSide > MaxDisplayPixelDimension)
-               {
-                   var ratio = (double)MaxDisplayPixelDimension / maxSide;
-                   var narrowWidth = Math.Max(1, (int)Math.Round(bitmap.Width * ratio));
-                   var narrowHeight = Math.Max(1, (int)Math.Round(bitmap.Height * ratio));
-
-                   var scaled = new DrawingBitmap(
-                       narrowWidth,
-                       narrowHeight,
-                       System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-
-                   try
-                   {
-                       using (var graphics = System.Drawing.Graphics.FromImage(scaled))
-                       {
-                           graphics.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
-                           graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                           graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
-                           graphics.DrawImage(
-                               bitmap,
-                               new System.Drawing.Rectangle(0, 0, narrowWidth, narrowHeight),
-                               0,
-                               0,
-                               bitmap.Width,
-                               bitmap.Height,
-                               System.Drawing.GraphicsUnit.Pixel);
-                       }
-                   }
-                   catch
-                   {
-                       scaled.Dispose();
-                       throw;
-                   }
-
-                   sourceBitmap = scaled;
-                   ownsSourceBitmap = true;
-               }
-
-               return CreateBitmapSource(sourceBitmap);
-           }
-           finally
-           {
-               if (ownsSourceBitmap)
-               {
-                   sourceBitmap.Dispose();
-               }
-           }
-       }
-
-       /// <summary>
-       /// 直接用 LockBits 的像素缓冲区生成 Bgra32 的 BitmapSource，省掉 PNG 编解码。
-       /// </summary>
-       private static BitmapSource CreateBitmapSource(DrawingBitmap bitmap)
-       {
-           var bounds = new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height);
-           var data = bitmap.LockBits(
-               bounds,
-               System.Drawing.Imaging.ImageLockMode.ReadOnly,
-               System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-
-           try
-           {
-               var source = BitmapSource.Create(
-                   bitmap.Width,
-                   bitmap.Height,
-                   96.0d,
-                   96.0d,
-                   PixelFormats.Bgra32,
-                   null,
-                   data.Scan0,
-                   data.Stride * bitmap.Height,
-                   data.Stride);
-
-               source.Freeze();
-               return source;
-           }
-           finally
-           {
-               bitmap.UnlockBits(data);
-           }
-       }
-
-        private void ImagePreviewWindow_Loaded(object sender, RoutedEventArgs e)
-        {
-            RequestImageLayoutUpdate();
-        }
-
-        private void ImagePreviewWindow_SizeChanged(object sender, SizeChangedEventArgs e)
-        {
-            if (e.NewSize.Width <= 0 || e.NewSize.Height <= 0)
-            {
-                return;
             }
 
-            if (e.NewSize.Width == e.PreviousSize.Width && e.NewSize.Height == e.PreviousSize.Height)
-            {
-                return;
-            }
-
-            if (!_draggingImage)
-            {
-                // 最大化过程的 SizeChanged 可能连续触发多次，合并成一次布局。
-                RequestImageLayoutUpdate();
-            }
-        }
-
-        /// <summary>
-        /// 把同一帧内的多次布局请求合并成一次，避免重复的 ResetImageLayout。
-        /// </summary>
-        private void RequestImageLayoutUpdate()
-        {
-            if (_layoutUpdatePending)
-            {
-                return;
-            }
-
-            _layoutUpdatePending = true;
-            Dispatcher.BeginInvoke(
-                System.Windows.Threading.DispatcherPriority.Background,
-                new Action(delegate
-                {
-                    _layoutUpdatePending = false;
-                    ResetImageLayout();
-                }));
-        }
-
-        private void ImagePreviewWindow_Closed(object sender, EventArgs e)
-        {
-            if (_interactionEndTimer != null)
-            {
-                _interactionEndTimer.Stop();
-                _interactionEndTimer.Tick -= InteractionEndTimer_Tick;
-                _interactionEndTimer = null;
-            }
-
-            PreviewImage.Source = null;
-            // 位图所有权属于调用方，这里只断开引用，由调用方通过 ReleaseBitmap 取回。
-        }
-
-        /// <summary>
-        /// 关闭窗口时把位图交还给调用方，供再次预览时复用缓存，避免重复截图。
-        /// </summary>
-        public DrawingBitmap ReleaseBitmap()
-        {
-            var bitmap = _bitmap;
-            _bitmap = null;
             return bitmap;
         }
 
-        private void ImagePreviewWindow_Deactivated(object sender, EventArgs e)
+        /// <summary>
+        /// 显示用位图源：超过显示上限的大图先降采样，减少 WPF 渲染与内存压力。
+        /// </summary>
+        private static BitmapSource CreateDisplaySource(DrawingBitmap bitmap)
         {
-            if (_suspendAutoHide || _isClosing)
+            if (bitmap == null)
+            {
+                return null;
+            }
+
+            var sourceBitmap = bitmap;
+            var ownsSourceBitmap = false;
+
+            try
+            {
+                var maxSide = Math.Max(bitmap.Width, bitmap.Height);
+                if (maxSide > MaxDisplayPixelDimension)
+                {
+                    var ratio = (double)MaxDisplayPixelDimension / maxSide;
+                    var narrowWidth = Math.Max(1, (int)Math.Round(bitmap.Width * ratio));
+                    var narrowHeight = Math.Max(1, (int)Math.Round(bitmap.Height * ratio));
+
+                    var scaled = new DrawingBitmap(
+                        narrowWidth,
+                        narrowHeight,
+                        System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+
+                    try
+                    {
+                        using (var graphics = System.Drawing.Graphics.FromImage(scaled))
+                        {
+                            graphics.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+                            graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                            graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                            graphics.DrawImage(
+                                bitmap,
+                                new System.Drawing.Rectangle(0, 0, narrowWidth, narrowHeight),
+                                0,
+                                0,
+                                bitmap.Width,
+                                bitmap.Height,
+                                System.Drawing.GraphicsUnit.Pixel);
+                        }
+                    }
+                    catch
+                    {
+                        scaled.Dispose();
+                        throw;
+                    }
+
+                    sourceBitmap = scaled;
+                    ownsSourceBitmap = true;
+                }
+
+                return CreateBitmapSource(sourceBitmap);
+            }
+            finally
+            {
+                if (ownsSourceBitmap)
+                {
+                    sourceBitmap.Dispose();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 直接用 LockBits 的像素缓冲区生成 Bgra32 的 BitmapSource，省掉 PNG 编解码。
+        /// </summary>
+        private static BitmapSource CreateBitmapSource(DrawingBitmap bitmap)
+        {
+            var bounds = new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height);
+            var data = bitmap.LockBits(
+                bounds,
+                System.Drawing.Imaging.ImageLockMode.ReadOnly,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+
+            try
+            {
+                var source = BitmapSource.Create(
+                    bitmap.Width,
+                    bitmap.Height,
+                    96.0d,
+                    96.0d,
+                    PixelFormats.Bgra32,
+                    null,
+                    data.Scan0,
+                    data.Stride * bitmap.Height,
+                    data.Stride);
+
+                source.Freeze();
+                return source;
+            }
+            finally
+            {
+                bitmap.UnlockBits(data);
+            }
+        }
+
+        #region 贴图布局与缩放
+
+        /// <summary>
+        /// 按原始像素尺寸贴图：1 图像像素对应 1 物理像素（已按 DPI 换算为 DIP），
+        /// 超过工作区限制时等比缩小，并居中贴到鼠标所在显示器的工作区。
+        /// </summary>
+        private void ApplyPinLayout()
+        {
+            if (_bitmap == null)
             {
                 return;
             }
 
-            ClearAnnotations();
-            _isClosing = true;
-            Close();
+            var dpi = GetDpiScale();
+            _baseImageWidth = _bitmap.Width / dpi;
+            _baseImageHeight = _bitmap.Height / dpi;
+
+            if (_baseImageWidth <= 0d || _baseImageHeight <= 0d)
+            {
+                return;
+            }
+
+            var workspace = GetTargetWorkspace();
+
+            _zoom = 1.0d;
+            var fitScale = Math.Min(
+                workspace.Width * MaxWorkspaceRatio / _baseImageWidth,
+                workspace.Height * MaxWorkspaceRatio / _baseImageHeight);
+            if (fitScale < 1.0d)
+            {
+                _zoom = Math.Max(MinZoom, fitScale);
+            }
+
+            ApplyVisualSize();
+            ApplyWindowSize();
+
+            Left = workspace.Left + ((workspace.Width - Width) / 2.0d);
+            Top = workspace.Top + ((workspace.Height - Height) / 2.0d);
         }
+
+        /// <summary>内容层尺寸与缩放：始终以图片左上角为原点。</summary>
+        private void ApplyVisualSize()
+        {
+            PreviewImage.Width = _baseImageWidth;
+            PreviewImage.Height = _baseImageHeight;
+            ImageBackdrop.Width = _baseImageWidth;
+            ImageBackdrop.Height = _baseImageHeight;
+            AnnotationCanvas.Width = _baseImageWidth;
+            AnnotationCanvas.Height = _baseImageHeight;
+            ContentCanvas.Width = _baseImageWidth;
+            ContentCanvas.Height = _baseImageHeight;
+            ContentScaleTransform.ScaleX = _zoom;
+            ContentScaleTransform.ScaleY = _zoom;
+        }
+
+        /// <summary>窗口尺寸跟随缩放变化，图片始终填满内容区。</summary>
+        private void ApplyWindowSize()
+        {
+            var contentWidth = Math.Max(1.0d, _baseImageWidth * _zoom);
+            var contentHeight = Math.Max(1.0d, _baseImageHeight * _zoom);
+
+            _suppressToolbarRefresh = true;
+            try
+            {
+                Width = contentWidth + (ContentOffset * 2.0d);
+                Height = contentHeight + (ContentOffset * 2.0d);
+            }
+            finally
+            {
+                _suppressToolbarRefresh = false;
+            }
+        }
+
+        /// <summary>
+        /// 当前 DIP 与物理像素的换算比（125% 缩放时为 1.25）。
+        /// </summary>
+        private double GetDpiScale()
+        {
+            var source = PresentationSource.FromVisual(this);
+            if (source == null)
+            {
+                // 首次 SetImage 时窗口可能还没创建句柄，先确保句柄存在才能读到准确的 DPI。
+                try
+                {
+                    new System.Windows.Interop.WindowInteropHelper(this).EnsureHandle();
+                }
+                catch
+                {
+                }
+
+                source = PresentationSource.FromVisual(this);
+            }
+
+            if (source != null && source.CompositionTarget != null)
+            {
+                var matrix = source.CompositionTarget.TransformToDevice;
+                if (matrix.M11 > 0d)
+                {
+                    return matrix.M11;
+                }
+            }
+
+            try
+            {
+                using (var graphics = System.Drawing.Graphics.FromHwnd(IntPtr.Zero))
+                {
+                    if (graphics.DpiX > 0f)
+                    {
+                        return graphics.DpiX / 96.0d;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return 1.0d;
+        }
+
+        /// <summary>
+        /// 鼠标所在显示器的工作区（DIP），即去掉任务栏后的可用区域。
+        /// </summary>
+        private Rect GetTargetWorkspace()
+        {
+            var fallback = new Rect(
+                SystemParameters.WorkArea.Left,
+                SystemParameters.WorkArea.Top,
+                SystemParameters.WorkArea.Width,
+                SystemParameters.WorkArea.Height);
+
+            try
+            {
+                var screen = System.Windows.Forms.Screen.FromPoint(System.Windows.Forms.Cursor.Position);
+                var workingArea = screen.WorkingArea;
+                if (workingArea.Width <= 0 || workingArea.Height <= 0)
+                {
+                    return fallback;
+                }
+
+                var dpi = GetDpiScale();
+                return new Rect(
+                    workingArea.Left / dpi,
+                    workingArea.Top / dpi,
+                    workingArea.Width / dpi,
+                    workingArea.Height / dpi);
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        /// <summary>
+        /// 以窗口内某点为锚点缩放：锚点下的图像位置保持不动。
+        /// </summary>
+        private void ChangeZoom(double factor, Point anchorInWindow)
+        {
+            if (_baseImageWidth <= 0d || _baseImageHeight <= 0d)
+            {
+                return;
+            }
+
+            var oldZoom = _zoom;
+            var newZoom = Math.Max(MinZoom, Math.Min(MaxZoom, oldZoom * factor));
+            if (Math.Abs(newZoom - oldZoom) < 0.0001d)
+            {
+                return;
+            }
+
+            // 锚点在图片坐标系中的相对位置（0~1）。
+            var relativeX = (anchorInWindow.X - Left - ContentOffset) / (_baseImageWidth * oldZoom);
+            var relativeY = (anchorInWindow.Y - Top - ContentOffset) / (_baseImageHeight * oldZoom);
+
+            _zoom = newZoom;
+            ApplyVisualSize();
+            ApplyWindowSize();
+
+            Left = anchorInWindow.X - ContentOffset - (relativeX * _baseImageWidth * newZoom);
+            Top = anchorInWindow.Y - ContentOffset - (relativeY * _baseImageHeight * newZoom);
+        }
+
+        private void RestoreOriginalSize()
+        {
+            if (_baseImageWidth <= 0d || _baseImageHeight <= 0d)
+            {
+                return;
+            }
+
+            // 以窗口中心为锚点回到 1:1 原尺寸。
+            var center = new Point(Left + (Width / 2.0d), Top + (Height / 2.0d));
+            var factor = 1.0d / _zoom;
+            ChangeZoom(factor, center);
+        }
+
+        #endregion
+
+        #region 工具栏显示控制
+
+        private void ShowToolbar()
+        {
+            StopToolbarHideTimer();
+
+            if (!ToolbarPopup.IsOpen)
+            {
+                ToolbarPopup.IsOpen = true;
+            }
+
+            RefreshToolbarPlacement();
+        }
+
+        private void ScheduleToolbarHide()
+        {
+            if (_toolbarHideTimer == null)
+            {
+                _toolbarHideTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+                {
+                    Interval = TimeSpan.FromMilliseconds(ToolbarHideDelayMilliseconds)
+                };
+                _toolbarHideTimer.Tick += ToolbarHideTimer_Tick;
+            }
+
+            _toolbarHideTimer.Stop();
+            _toolbarHideTimer.Start();
+        }
+
+        private void StopToolbarHideTimer()
+        {
+            if (_toolbarHideTimer != null)
+            {
+                _toolbarHideTimer.Stop();
+            }
+        }
+
+        private void ToolbarHideTimer_Tick(object sender, EventArgs e)
+        {
+            StopToolbarHideTimer();
+
+            // 鼠标正停在工具栏上时保持显示（点击工具栏按钮会让主窗口失活，不能据此关闭）。
+            if (IsMouseOverToolbar())
+            {
+                return;
+            }
+
+            // 色板弹层依附在工具栏上，工具栏关闭会连带关闭色板。
+            if (BackgroundColorPopup.IsOpen)
+            {
+                return;
+            }
+
+            // 切到 Word 或其他程序后，工具栏不应继续浮在最上层。
+            if (!IsActive && _activeTextEditor == null)
+            {
+                ToolbarPopup.IsOpen = false;
+                return;
+            }
+
+            // 标注中或正在输入文字时保持显示，避免操作途中工具栏消失。
+            if (ShouldKeepToolbarVisible())
+            {
+                return;
+            }
+
+            ToolbarPopup.IsOpen = false;
+        }
+
+        /// <summary>
+        /// 正在标注、编辑文字或选择底色时，工具栏保持可见，避免操作中途消失。
+        /// </summary>
+        private bool ShouldKeepToolbarVisible()
+        {
+            return _currentTool != AnnotationTool.None ||
+                   _activeTextEditor != null ||
+                   BackgroundColorPopup.IsOpen;
+        }
+
+        private bool IsMouseOverToolbar()
+        {
+            if (!ToolbarPopup.IsOpen)
+            {
+                return false;
+            }
+
+            return ToolbarPanel.IsMouseOver;
+        }
+
+        /// <summary>
+        /// 窗口移动或缩放后，微调 Popup 偏移强制重新计算位置，让工具栏跟随贴图。
+        /// </summary>
+        private void RefreshToolbarPlacement()
+        {
+            if (!ToolbarPopup.IsOpen || _suppressToolbarRefresh)
+            {
+                return;
+            }
+
+            var offset = ToolbarPopup.HorizontalOffset;
+            ToolbarPopup.HorizontalOffset = offset + 0.1d;
+            ToolbarPopup.HorizontalOffset = offset;
+        }
+
+        private void Window_MouseEnter(object sender, MouseEventArgs e)
+        {
+            ShowToolbar();
+        }
+
+        private void Window_MouseLeave(object sender, MouseEventArgs e)
+        {
+            // 点击工具栏按钮时鼠标会离开主窗口，但工具栏仍处于鼠标悬停状态；
+            // 这种情况下不隐藏，交给工具栏自身的 MouseLeave 决定。
+            if (IsMouseOverToolbar())
+            {
+                return;
+            }
+
+            if (ShouldKeepToolbarVisible())
+            {
+                return;
+            }
+
+            ScheduleToolbarHide();
+        }
+
+        private void ToolbarPanel_MouseLeave(object sender, MouseEventArgs e)
+        {
+            if (ShouldKeepToolbarVisible())
+            {
+                return;
+            }
+
+            ScheduleToolbarHide();
+        }
+
+        private void Window_Deactivated(object sender, EventArgs e)
+        {
+            CommitOrCancelTextEditing();
+
+            // 切换到 Word 或其他程序时工具栏不应继续浮在最上层；
+            // 但要留出时间给工具栏按钮的点击处理（点击按钮同样会触发失活）。
+            if (IsMouseOverToolbar())
+            {
+                return;
+            }
+
+            if (ShouldKeepToolbarVisible())
+            {
+                return;
+            }
+
+            ScheduleToolbarHide();
+        }
+
+        /// <summary>
+        /// 把焦点交还给贴图本体，避免工具栏按钮抢走焦点后滚轮/键盘失效。
+        /// </summary>
+        private void RefocusPin()
+        {
+            try
+            {
+                if (IsVisible)
+                {
+                    Activate();
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private void Window_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            RefreshToolbarPlacement();
+        }
+
+        private void Window_LocationChanged(object sender, EventArgs e)
+        {
+            RefreshToolbarPlacement();
+        }
+
+        #endregion
 
         private void Window_KeyDown(object sender, KeyEventArgs e)
         {
@@ -336,22 +630,23 @@ namespace WordPictureAddIn
 
             if (e.Key == Key.Escape)
             {
+                if (BackgroundColorPopup.IsOpen)
+                {
+                    BackgroundColorPopup.IsOpen = false;
+                    e.Handled = true;
+                    return;
+                }
+
                 if (_currentTool != AnnotationTool.None)
                 {
                     CancelTextEditing();
                     ClearToolSelection();
+                    e.Handled = true;
+                    return;
                 }
-                else
-                {
-                    if (_isClosing)
-                    {
-                        return;
-                    }
 
-                    ClearAnnotations();
-                    _isClosing = true;
-                    Close();
-                }
+                ClosePin();
+                e.Handled = true;
             }
         }
 
@@ -367,6 +662,21 @@ namespace WordPictureAddIn
         }
 
         private void CloseButton_Click(object sender, RoutedEventArgs e)
+        {
+            ClosePin();
+        }
+
+        /// <summary>
+        /// 工具栏按钮点击后把焦点交还给贴图窗口，保证 Esc / Ctrl+Z 仍然可用。
+        /// 注意：Popup 中的按钮点击会让主窗口失活，因此每次点击后都重新激活。
+        /// </summary>
+        private void ToolbarActionCompleted()
+        {
+            RefocusPin();
+            ShowToolbar();
+        }
+
+        private void ClosePin()
         {
             if (_isClosing)
             {
@@ -384,13 +694,15 @@ namespace WordPictureAddIn
             CommitOrCancelTextEditing();
             ClearToolSelection();
             UndoLastAnnotation();
+            ToolbarActionCompleted();
         }
 
-        private void ResetZoomButton_Click(object sender, RoutedEventArgs e)
+        private void RestoreSizeButton_Click(object sender, RoutedEventArgs e)
         {
             CommitOrCancelTextEditing();
             ClearToolSelection();
-            RestoreInitialView();
+            RestoreOriginalSize();
+            ToolbarActionCompleted();
         }
 
         private void BackgroundColorButton_Click(object sender, RoutedEventArgs e)
@@ -416,7 +728,7 @@ namespace WordPictureAddIn
             ApplyBackgroundColor(color);
             SaveBackgroundColor(color);
             BackgroundColorPopup.IsOpen = false;
-            Activate();
+            ToolbarActionCompleted();
         }
 
         private void CustomBackgroundColorButton_Click(object sender, RoutedEventArgs e)
@@ -424,7 +736,6 @@ namespace WordPictureAddIn
             BackgroundColorPopup.IsOpen = false;
             CommitOrCancelTextEditing();
 
-            _suspendAutoHide = true;
             try
             {
                 using (var dialog = new System.Windows.Forms.ColorDialog
@@ -452,8 +763,7 @@ namespace WordPictureAddIn
             }
             finally
             {
-                _suspendAutoHide = false;
-                Activate();
+                ToolbarActionCompleted();
             }
         }
 
@@ -473,10 +783,16 @@ namespace WordPictureAddIn
         {
             if (string.Equals(colorText, TransparentBackgroundColor, StringComparison.OrdinalIgnoreCase))
             {
-                return Brushes.Transparent;
+                // 完全透明的画刷在分层窗口里不参与命中测试，用 1/255 的白色保证整张图可拖动、可双击。
+                return CreateFrozenBrush(Color.FromArgb(1, 255, 255, 255));
             }
 
             var color = ParseColor(colorText) ?? ParseColor(DefaultBackgroundColor).Value;
+            return CreateFrozenBrush(color);
+        }
+
+        private static Brush CreateFrozenBrush(Color color)
+        {
             var brush = new SolidColorBrush(color);
             brush.Freeze();
             return brush;
@@ -510,22 +826,20 @@ namespace WordPictureAddIn
         private void UpdateBackgroundColorPreview(Brush fill)
         {
             var solid = fill as SolidColorBrush;
-            if (solid == null || solid.Color.A == 0)
+            if (solid == null || solid.Color.A <= 1)
             {
                 // 透明时用棋盘格图标表示
                 BackgroundColorPreview.Fill = TryFindResource("CheckerboardBrush") as Brush;
                 return;
             }
 
-            var preview = new SolidColorBrush(solid.Color);
-            preview.Freeze();
-            BackgroundColorPreview.Fill = preview;
+            BackgroundColorPreview.Fill = CreateFrozenBrush(solid.Color);
         }
 
         private static System.Drawing.Color ToDrawingColor(Brush brush)
         {
             var solid = brush as SolidColorBrush;
-            if (solid == null || solid.Color.A == 0)
+            if (solid == null || solid.Color.A <= 1)
             {
                 return System.Drawing.Color.Empty;
             }
@@ -574,13 +888,12 @@ namespace WordPictureAddIn
                 Filter = "PNG Image|*.png|JPEG Image|*.jpg;*.jpeg|BMP Image|*.bmp",
                 AddExtension = true,
                 DefaultExt = ".png",
-                FileName = "word-preview.png"
+                FileName = "word-picture.png"
             };
 
-            _suspendAutoHide = true;
             try
             {
-                if (dialog.ShowDialog() != true)
+                if (dialog.ShowDialog(this) != true)
                 {
                     return;
                 }
@@ -608,10 +921,12 @@ namespace WordPictureAddIn
                     savedBitmap.Save(dialog.FileName, imageFormat);
                 }
             }
+            catch
+            {
+            }
             finally
             {
-                _suspendAutoHide = false;
-                Activate();
+                ToolbarActionCompleted();
             }
         }
 
@@ -786,6 +1101,7 @@ namespace WordPictureAddIn
                 _currentTool = AnnotationTool.None;
                 AnnotationCanvas.IsHitTestVisible = false;
                 UpdateCursorVisual();
+                ScheduleToolbarHide();
                 return;
             }
 
@@ -813,6 +1129,7 @@ namespace WordPictureAddIn
 
             AnnotationCanvas.IsHitTestVisible = _currentTool != AnnotationTool.None;
             UpdateCursorVisual();
+            ShowToolbar();
         }
 
         private void Window_MouseWheel(object sender, MouseWheelEventArgs e)
@@ -824,13 +1141,18 @@ namespace WordPictureAddIn
 
             var factor = e.Delta > 0 ? ZoomStepFactor : 1.0d / ZoomStepFactor;
             BeginImageInteraction();
-            ChangeZoom(factor, e.GetPosition(ImageCanvas));
+            ChangeZoom(factor, e.GetPosition(this));
             EndImageInteraction();
             e.Handled = true;
         }
 
+        private void PreviewImage_MouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            Window_MouseWheel(sender, e);
+        }
+
         /// <summary>
-        /// 缩放/拖拽期间临时降低位图缩放质量，交互结束后恢复，减轻全屏分层窗口的渲染压力。
+        /// 缩放/拖动期间临时降低位图缩放质量，交互结束后恢复，减轻渲染压力。
         /// </summary>
         private void BeginImageInteraction()
         {
@@ -842,8 +1164,8 @@ namespace WordPictureAddIn
 
             if (_interactionEndTimer == null)
             {
-                _interactionEndTimer = new System.Windows.Threading.DispatcherTimer(
-                    System.Windows.Threading.DispatcherPriority.Background,
+                _interactionEndTimer = new DispatcherTimer(
+                    DispatcherPriority.Background,
                     Dispatcher)
                 {
                     Interval = TimeSpan.FromMilliseconds(140)
@@ -863,18 +1185,6 @@ namespace WordPictureAddIn
             }
         }
 
-        /// <summary>
-        /// 交互持续进行时（如长距离拖拽）刷新计时器，避免中途恢复高质量渲染。
-        /// </summary>
-        private void ExtendImageInteraction()
-        {
-            if (_interactionEndTimer != null && _interactionDepth > 0)
-            {
-                _interactionEndTimer.Stop();
-                _interactionEndTimer.Start();
-            }
-        }
-
         private void InteractionEndTimer_Tick(object sender, EventArgs e)
         {
             if (_interactionEndTimer != null)
@@ -884,52 +1194,39 @@ namespace WordPictureAddIn
 
             _interactionDepth = 0;
             RenderOptions.SetBitmapScalingMode(PreviewImage, BitmapScalingMode.HighQuality);
-        }
-
-        private void PreviewImage_MouseWheel(object sender, MouseWheelEventArgs e)
-        {
-            Window_MouseWheel(sender, e);
+            RefreshToolbarPlacement();
         }
 
         private void PreviewImage_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
+            if (e.ClickCount == 2 && _currentTool == AnnotationTool.None)
+            {
+                // 双击图片直接关闭贴图（Snipaste 习惯）
+                e.Handled = true;
+                ClosePin();
+                return;
+            }
+
             if (_currentTool != AnnotationTool.None)
             {
                 return;
             }
 
-            _draggingImage = true;
-            _dragStart = e.GetPosition(ImageCanvas);
-            _dragOriginX = ContentTranslateTransform.X;
-            _dragOriginY = ContentTranslateTransform.Y;
-            BeginImageInteraction();
-            ContentCanvas.CaptureMouse();
-            e.Handled = true;
-        }
+            CommitOrCancelTextEditing();
 
-        private void PreviewImage_MouseMove(object sender, MouseEventArgs e)
-        {
-            if (!_draggingImage || _currentTool != AnnotationTool.None)
+            if (e.ButtonState == MouseButtonState.Pressed)
             {
-                return;
+                try
+                {
+                    // 交给系统拖动，移动过程平滑且能跨屏
+                    DragMove();
+                }
+                catch (InvalidOperationException)
+                {
+                }
             }
 
-            var point = e.GetPosition(ImageCanvas);
-            ContentTranslateTransform.X = _dragOriginX + (point.X - _dragStart.X);
-            ContentTranslateTransform.Y = _dragOriginY + (point.Y - _dragStart.Y);
-            ClampTranslation();
-            ExtendImageInteraction();
-        }
-
-        private void PreviewImage_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-        {
-            if (_draggingImage)
-            {
-                EndImageInteraction();
-            }
-
-            _draggingImage = false;
-            ContentCanvas.ReleaseMouseCapture();
+            RefreshToolbarPlacement();
             e.Handled = true;
         }
 
@@ -940,7 +1237,7 @@ namespace WordPictureAddIn
                 return;
             }
 
-            var point = ToContentCoordinates(e.GetPosition(ImageCanvas));
+            var point = ToContentCoordinates(e.GetPosition(ContentCanvas));
 
             if (_currentTool == AnnotationTool.Text)
             {
@@ -963,7 +1260,7 @@ namespace WordPictureAddIn
                 return;
             }
 
-            var point = ToContentCoordinates(e.GetPosition(ImageCanvas));
+            var point = ToContentCoordinates(e.GetPosition(ContentCanvas));
             UpdatePreviewAnnotation(_annotationStart, point);
         }
 
@@ -977,112 +1274,16 @@ namespace WordPictureAddIn
             _drawingAnnotation = false;
             AnnotationCanvas.ReleaseMouseCapture();
 
-            var point = ToContentCoordinates(e.GetPosition(ImageCanvas));
+            var point = ToContentCoordinates(e.GetPosition(ContentCanvas));
             CommitPreviewAnnotation(_annotationStart, point);
             RemovePreviewAnnotation();
-            UpdateCursorVisual();
             e.Handled = true;
         }
 
-        private void Window_MouseMove(object sender, MouseEventArgs e)
+        /// <summary>标注坐标直接存于图片基准坐标系，无需再反算窗口平移。</summary>
+        private static Point ToContentCoordinates(Point canvasPoint)
         {
-            var point = e.GetPosition(RootGrid);
-
-            if (IsPointInsideToolbar(point) || IsPointInsideCloseButton(point))
-            {
-                CursorOverlay.Visibility = Visibility.Collapsed;
-                return;
-            }
-
-            CursorOverlay.Visibility = Visibility.Visible;
-            UpdateCursorPosition(point);
-        }
-
-        private void ResetImageLayout()
-        {
-            if (_bitmap == null || ActualWidth <= 0 || ActualHeight <= 0)
-            {
-                return;
-            }
-
-            var usableWidth = Math.Max(100.0d, ActualWidth - 80.0d);
-            var usableHeight = Math.Max(100.0d, ActualHeight - 80.0d);
-            var scaleX = usableWidth / _bitmap.Width;
-            var scaleY = usableHeight / _bitmap.Height;
-            _zoom = Math.Min(1.0d, Math.Min(scaleX, scaleY));
-            _zoom = Math.Max(0.1d, _zoom);
-
-            _baseImageWidth = _bitmap.Width * _zoom;
-            _baseImageHeight = _bitmap.Height * _zoom;
-            PreviewImage.Width = _baseImageWidth;
-            PreviewImage.Height = _baseImageHeight;
-            ImageBackdrop.Width = _baseImageWidth;
-            ImageBackdrop.Height = _baseImageHeight;
-            AnnotationCanvas.Width = _baseImageWidth;
-            AnnotationCanvas.Height = _baseImageHeight;
-            ContentCanvas.Width = _baseImageWidth;
-            ContentCanvas.Height = _baseImageHeight;
-            ContentScaleTransform.ScaleX = 1.0d;
-            ContentScaleTransform.ScaleY = 1.0d;
-            ContentTranslateTransform.X = (ActualWidth - _baseImageWidth) / 2.0d;
-            ContentTranslateTransform.Y = (ActualHeight - _baseImageHeight) / 2.0d;
-
-            _initialScale = 1.0d;
-            _initialTranslateX = ContentTranslateTransform.X;
-            _initialTranslateY = ContentTranslateTransform.Y;
-        }
-
-        private void ChangeZoom(double factor, Point cursorPoint)
-        {
-            var oldScale = ContentScaleTransform.ScaleX;
-            var newScale = Math.Max(0.1d, Math.Min(8.0d, oldScale * factor));
-
-            var actualWidth = _baseImageWidth * oldScale;
-            var actualHeight = _baseImageHeight * oldScale;
-            if (actualWidth <= 0 || actualHeight <= 0)
-            {
-                return;
-            }
-
-            var relativeX = (cursorPoint.X - ContentTranslateTransform.X) / actualWidth;
-            var relativeY = (cursorPoint.Y - ContentTranslateTransform.Y) / actualHeight;
-
-            ContentScaleTransform.ScaleX = newScale;
-            ContentScaleTransform.ScaleY = newScale;
-
-            var newWidth = _baseImageWidth * newScale;
-            var newHeight = _baseImageHeight * newScale;
-            ContentTranslateTransform.X = cursorPoint.X - (newWidth * relativeX);
-            ContentTranslateTransform.Y = cursorPoint.Y - (newHeight * relativeY);
-            ClampTranslation();
-        }
-
-        private void ClampTranslation()
-        {
-            var imageWidth = _baseImageWidth * ContentScaleTransform.ScaleX;
-            var imageHeight = _baseImageHeight * ContentScaleTransform.ScaleY;
-
-            if (imageWidth <= ActualWidth)
-            {
-                ContentTranslateTransform.X = (ActualWidth - imageWidth) / 2.0d;
-            }
-            else
-            {
-                var minX = ActualWidth - imageWidth - 24.0d;
-                var maxX = 24.0d;
-                ContentTranslateTransform.X = Math.Max(minX, Math.Min(maxX, ContentTranslateTransform.X));
-            }
-
-            if (imageHeight <= ActualHeight)
-            {
-                ContentTranslateTransform.Y = (ActualHeight - imageHeight) / 2.0d;
-            }
-            else
-            {
-                var minY = ActualHeight - imageHeight - 24.0d;
-                var maxY = 24.0d;
-                ContentTranslateTransform.Y = Math.Max(minY, Math.Min(maxY, ContentTranslateTransform.Y));
-            }
+            return canvasPoint;
         }
 
         private void SetToolButtonState(ToggleButton button, bool isChecked)
@@ -1103,29 +1304,6 @@ namespace WordPictureAddIn
             SetToolButtonState(ArrowToolButton, false);
             SetToolButtonState(TextToolButton, false);
             UpdateCursorVisual();
-        }
-
-        private void RestoreInitialView()
-        {
-            ContentScaleTransform.ScaleX = _initialScale;
-            ContentScaleTransform.ScaleY = _initialScale;
-            ContentTranslateTransform.X = _initialTranslateX;
-            ContentTranslateTransform.Y = _initialTranslateY;
-        }
-
-        private Point ToContentCoordinates(Point canvasPoint)
-        {
-            var scaleX = ContentScaleTransform.ScaleX;
-            var scaleY = ContentScaleTransform.ScaleY;
-
-            if (scaleX == 0.0d || scaleY == 0.0d)
-            {
-                return new Point(0, 0);
-            }
-
-            return new Point(
-                (canvasPoint.X - ContentTranslateTransform.X) / scaleX,
-                (canvasPoint.Y - ContentTranslateTransform.Y) / scaleY);
         }
 
         private void CreatePreviewAnnotation(Point point)
@@ -1371,8 +1549,8 @@ namespace WordPictureAddIn
 
             var container = new Grid
             {
-                Width = 220,
-                Height = 56
+                Width = 200,
+                Height = 48
             };
 
             var rectangle = new Rectangle
@@ -1391,12 +1569,12 @@ namespace WordPictureAddIn
                 Background = Brushes.Transparent,
                 Foreground = Brushes.OrangeRed,
                 FontFamily = new FontFamily("Microsoft YaHei UI"),
-                FontSize = 22,
+                FontSize = 20,
                 FontWeight = FontWeights.Bold,
                 AcceptsReturn = true,
                 TextWrapping = TextWrapping.Wrap,
                 VerticalContentAlignment = VerticalAlignment.Center,
-                Padding = new Thickness(8, 6, 8, 6),
+                Padding = new Thickness(6, 4, 6, 4),
                 CaretBrush = Brushes.OrangeRed
             };
 
@@ -1434,12 +1612,11 @@ namespace WordPictureAddIn
                     Text = text,
                     Foreground = Brushes.OrangeRed,
                     FontFamily = new FontFamily("Microsoft YaHei UI"),
-                    FontSize = 24,
+                    FontSize = 20,
                     FontWeight = FontWeights.Bold,
                     TextWrapping = TextWrapping.Wrap,
                     Width = _activeTextEditorContainer.Width,
-                    Margin = new Thickness(8, 6, 8, 6),
-                    LineHeight = 28
+                    Margin = new Thickness(6, 4, 6, 4)
                 };
 
                 _activeTextEditorContainer.Children.Clear();
@@ -1518,32 +1695,62 @@ namespace WordPictureAddIn
             return rect.Contains(rootPoint);
         }
 
-        private bool IsPointInsideCloseButton(Point point)
-        {
-            var topLeft = CloseButton.TranslatePoint(new Point(0, 0), RootGrid);
-            var rect = new Rect(topLeft.X, topLeft.Y, CloseButton.ActualWidth, CloseButton.ActualHeight);
-            return rect.Contains(point);
-        }
-
-        private bool IsPointInsideToolbar(Point point)
-        {
-            var toolbarTopLeft = ToolbarPanel.TranslatePoint(new Point(0, 0), RootGrid);
-            var rect = new Rect(toolbarTopLeft.X, toolbarTopLeft.Y, ToolbarPanel.ActualWidth, ToolbarPanel.ActualHeight);
-            return rect.Contains(point);
-        }
-
         private void UpdateCursorVisual()
         {
-            var isDrawMode = _currentTool != AnnotationTool.None;
-            HandCursorVisual.Visibility = isDrawMode ? Visibility.Collapsed : Visibility.Visible;
-            PenCursorVisual.Visibility = isDrawMode ? Visibility.Visible : Visibility.Collapsed;
+            Cursor cursor;
+            switch (_currentTool)
+            {
+                case AnnotationTool.None:
+                    cursor = Cursors.SizeAll;
+                    break;
+                case AnnotationTool.Text:
+                    cursor = Cursors.IBeam;
+                    break;
+                default:
+                    cursor = Cursors.Cross;
+                    break;
+            }
+
+            // 标注模式下鼠标实际落在 AnnotationCanvas 上，两层都要设置光标。
+            ImageCanvas.Cursor = cursor;
+            AnnotationCanvas.Cursor = cursor;
         }
 
-        private void UpdateCursorPosition(Point point)
+        /// <summary>释放本窗口持有的位图。</summary>
+        private void ReleaseImage()
         {
-            var activeCursor = _currentTool != AnnotationTool.None ? (FrameworkElement)PenCursorVisual : HandCursorVisual;
-            Canvas.SetLeft(activeCursor, point.X + 1);
-            Canvas.SetTop(activeCursor, point.Y + 1);
+            PreviewImage.Source = null;
+
+            if (_bitmap != null && _ownsBitmap)
+            {
+                _bitmap.Dispose();
+            }
+
+            _bitmap = null;
+            _ownsBitmap = false;
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            if (_interactionEndTimer != null)
+            {
+                _interactionEndTimer.Stop();
+                _interactionEndTimer.Tick -= InteractionEndTimer_Tick;
+                _interactionEndTimer = null;
+            }
+
+            if (_toolbarHideTimer != null)
+            {
+                _toolbarHideTimer.Stop();
+                _toolbarHideTimer.Tick -= ToolbarHideTimer_Tick;
+                _toolbarHideTimer = null;
+            }
+
+            ToolbarPopup.IsOpen = false;
+            BackgroundColorPopup.IsOpen = false;
+            ReleaseImage();
+
+            base.OnClosed(e);
         }
 
         private enum AnnotationTool
@@ -1557,8 +1764,8 @@ namespace WordPictureAddIn
         }
 
         /// <summary>
-        /// 把预览窗口句柄包装成 IWin32Window，使颜色对话框以预览窗口为 owner，
-        /// 避免被 Topmost 的预览窗口遮挡。
+        /// 把贴图窗口句柄包装成 IWin32Window，使颜色对话框以贴图窗口为 owner，
+        /// 避免被 Topmost 的贴图窗口遮挡。
         /// </summary>
         private sealed class NativeWindowOwner : System.Windows.Forms.IWin32Window
         {
