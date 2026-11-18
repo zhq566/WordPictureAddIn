@@ -15,6 +15,9 @@
         UseLayoutRounding="True"
         KeyDown="Window_KeyDown"
         MouseDown="Window_MouseDown"
+        MouseMove="Window_MouseMove"
+        MouseLeftButtonUp="Window_MouseLeftButtonUp"
+        LostMouseCapture="Window_LostMouseCapture"
         MouseWheel="Window_MouseWheel"
         MouseEnter="Window_MouseEnter"
         MouseLeave="Window_MouseLeave"
@@ -247,6 +250,8 @@
                     <Canvas.RenderTransform>
                         <TransformGroup>
                             <ScaleTransform x:Name="ContentScaleTransform" ScaleX="1" ScaleY="1"/>
+                            <!-- 放大到超出窗口后，用平移偏移让图片在视口内移动 -->
+                            <TranslateTransform x:Name="ContentPanTransform" X="0" Y="0"/>
                         </TransformGroup>
                     </Canvas.RenderTransform>
                     <Rectangle x:Name="ImageBackdrop"

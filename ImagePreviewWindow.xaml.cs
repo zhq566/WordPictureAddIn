@@ -66,6 +66,17 @@ namespace WordPictureAddIn
         private double _baseImageWidth;
         private double _baseImageHeight;
         private double _zoom = 1.0d;
+
+        /// <summary>内容超出视口后的平移偏移（DIP，负值表示内容向左上移），始终限制在 [视口 - 内容, 0]。</summary>
+        private double _panX;
+        private double _panY;
+
+        /// <summary>是否正在用左键拖动平移内容（而不是拖动窗口）。</summary>
+        private bool _isPanning;
+        private Point _panStartMouse;
+        private double _panStartOffsetX;
+        private double _panStartOffsetY;
+
         private bool _drawingAnnotation;
         private Point _annotationStart;
         private Shape _previewShape;
@@ -296,14 +307,19 @@ namespace WordPictureAddIn
                 _zoom = Math.Max(MinZoom, fitScale);
             }
 
+            _panX = 0d;
+            _panY = 0d;
+
             ApplyVisualSize();
-            ApplyWindowSize();
+            ApplyWindowSize(workspace);
 
             Left = workspace.Left + ((workspace.Width - Width) / 2.0d);
             Top = workspace.Top + ((workspace.Height - Height) / 2.0d);
+
+            UpdateCursorVisual();
         }
 
-        /// <summary>内容层尺寸与缩放：始终以图片左上角为原点。</summary>
+        /// <summary>内容层尺寸与缩放：始终以图片左上角为原点，平移偏移叠加在缩放之后。</summary>
         private void ApplyVisualSize()
         {
             PreviewImage.Width = _baseImageWidth;
@@ -316,10 +332,26 @@ namespace WordPictureAddIn
             ContentCanvas.Height = _baseImageHeight;
             ContentScaleTransform.ScaleX = _zoom;
             ContentScaleTransform.ScaleY = _zoom;
+            ContentPanTransform.X = _panX;
+            ContentPanTransform.Y = _panY;
         }
 
-        /// <summary>窗口尺寸跟随缩放变化，图片始终填满内容区。</summary>
-        private void ApplyWindowSize()
+        /// <summary>
+        /// 视口内可用区域的宽高（DIP）：窗口尺寸上限就是当前显示器工作区，
+        /// 内容超出视口后窗口不再变大，靠平移继续查看图片。
+        /// </summary>
+        private static double GetMaxViewportWidth(Rect workspace)
+        {
+            return Math.Max(1.0d, workspace.Width - (ContentOffset * 2.0d));
+        }
+
+        private static double GetMaxViewportHeight(Rect workspace)
+        {
+            return Math.Max(1.0d, workspace.Height - (ContentOffset * 2.0d));
+        }
+
+        /// <summary>窗口尺寸跟随缩放变化，最大不超过所在显示器的工作区。</summary>
+        private void ApplyWindowSize(Rect workspace)
         {
             var contentWidth = Math.Max(1.0d, _baseImageWidth * _zoom);
             var contentHeight = Math.Max(1.0d, _baseImageHeight * _zoom);
@@ -327,8 +359,8 @@ namespace WordPictureAddIn
             _suppressToolbarRefresh = true;
             try
             {
-                Width = contentWidth + (ContentOffset * 2.0d);
-                Height = contentHeight + (ContentOffset * 2.0d);
+                Width = Math.Min(contentWidth, GetMaxViewportWidth(workspace)) + (ContentOffset * 2.0d);
+                Height = Math.Min(contentHeight, GetMaxViewportHeight(workspace)) + (ContentOffset * 2.0d);
             }
             finally
             {
@@ -416,7 +448,52 @@ namespace WordPictureAddIn
         }
 
         /// <summary>
+        /// 贴图窗口当前所在显示器的工作区（DIP）。
+        /// </summary>
+        private Rect GetWindowWorkspace()
+        {
+            var fallback = GetTargetWorkspace();
+
+            try
+            {
+                var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+                if (handle == IntPtr.Zero)
+                {
+                    return fallback;
+                }
+
+                var screen = System.Windows.Forms.Screen.FromHandle(handle);
+                var workingArea = screen.WorkingArea;
+                if (workingArea.Width <= 0 || workingArea.Height <= 0)
+                {
+                    return fallback;
+                }
+
+                var dpi = GetDpiScale();
+                return new Rect(
+                    workingArea.Left / dpi,
+                    workingArea.Top / dpi,
+                    workingArea.Width / dpi,
+                    workingArea.Height / dpi);
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        /// <summary>
+        /// 把平移偏移限制在 [视口 - 内容, 0]，保证内容既不会被拖出视口，也不会露出空白。
+        /// </summary>
+        private static double ClampPan(double offset, double viewportLength, double contentLength)
+        {
+            var minOffset = Math.Min(0d, viewportLength - contentLength);
+            return Math.Max(minOffset, Math.Min(0d, offset));
+        }
+
+        /// <summary>
         /// 以窗口内某点为锚点缩放：锚点下的图像位置保持不动。
+        /// 内容超出工作区时窗口不再变大，改为贴齐工作区并用平移保持锚点。
         /// </summary>
         private void ChangeZoom(double factor, Point anchorInWindow)
         {
@@ -432,16 +509,75 @@ namespace WordPictureAddIn
                 return;
             }
 
-            // 锚点在图片坐标系中的相对位置（0~1）。
-            var relativeX = (anchorInWindow.X - Left - ContentOffset) / (_baseImageWidth * oldZoom);
-            var relativeY = (anchorInWindow.Y - Top - ContentOffset) / (_baseImageHeight * oldZoom);
+            // 锚点在图片基准坐标系（未缩放）中的位置，旧的平移偏移要计入。
+            var imageX = (anchorInWindow.X - Left - ContentOffset - _panX) / oldZoom;
+            var imageY = (anchorInWindow.Y - Top - ContentOffset - _panY) / oldZoom;
+
+            var workspace = GetWindowWorkspace();
+            var contentWidth = Math.Max(1.0d, _baseImageWidth * newZoom);
+            var contentHeight = Math.Max(1.0d, _baseImageHeight * newZoom);
 
             _zoom = newZoom;
-            ApplyVisualSize();
-            ApplyWindowSize();
+            ApplyWindowSize(workspace);
 
-            Left = anchorInWindow.X - ContentOffset - (relativeX * _baseImageWidth * newZoom);
-            Top = anchorInWindow.Y - ContentOffset - (relativeY * _baseImageHeight * newZoom);
+            // 视口按窗口的实际尺寸取，系统对窗口尺寸的限制也能被正确考虑。
+            var viewportWidth = Math.Max(1.0d, Width - (ContentOffset * 2.0d));
+            var viewportHeight = Math.Max(1.0d, Height - (ContentOffset * 2.0d));
+
+            if (contentWidth > viewportWidth + 0.01d)
+            {
+                // 横向超出：窗口已撑到工作区宽度，位置尽量保持不动，用平移让锚点下的像素停在原处。
+                Left = ClampWindowOrigin(Left, workspace.Left, workspace.Width, Width);
+                _panX = ClampPan(
+                    anchorInWindow.X - Left - ContentOffset - (imageX * newZoom),
+                    viewportWidth,
+                    contentWidth);
+            }
+            else
+            {
+                // 完整放得下：回到"窗口等于整张图"的原始行为，并留在工作区内。
+                _panX = 0d;
+                Left = ClampWindowOrigin(
+                    anchorInWindow.X - ContentOffset - (imageX * newZoom),
+                    workspace.Left,
+                    workspace.Width,
+                    Width);
+            }
+
+            if (contentHeight > viewportHeight + 0.01d)
+            {
+                Top = ClampWindowOrigin(Top, workspace.Top, workspace.Height, Height);
+                _panY = ClampPan(
+                    anchorInWindow.Y - Top - ContentOffset - (imageY * newZoom),
+                    viewportHeight,
+                    contentHeight);
+            }
+            else
+            {
+                _panY = 0d;
+                Top = ClampWindowOrigin(
+                    anchorInWindow.Y - ContentOffset - (imageY * newZoom),
+                    workspace.Top,
+                    workspace.Height,
+                    Height);
+            }
+
+            ApplyVisualSize();
+
+            // 缩放到超出/回落到视口内时，左键的含义会变化（平移图片 / 拖动窗口），光标要跟着切换。
+            UpdateCursorVisual();
+        }
+
+        /// <summary>窗口原点限制在工作区内，避免缩小后贴图跑到屏幕外。</summary>
+        private static double ClampWindowOrigin(double origin, double workspaceOrigin, double workspaceLength, double windowLength)
+        {
+            var maxOrigin = workspaceOrigin + workspaceLength - windowLength;
+            if (maxOrigin < workspaceOrigin)
+            {
+                return workspaceOrigin;
+            }
+
+            return Math.Max(workspaceOrigin, Math.Min(maxOrigin, origin));
         }
 
         private void RestoreOriginalSize()
@@ -1567,6 +1703,15 @@ namespace WordPictureAddIn
 
             if (e.ButtonState == MouseButtonState.Pressed)
             {
+                if (HasOverflowingContent() && (Keyboard.Modifiers & ModifierKeys.Control) != ModifierKeys.Control)
+                {
+                    // 图片超出视口：左键改为平移内容，避免窗口无法移动导致看不到其余部分。
+                    // 仍想移动窗口时按住 Ctrl。
+                    StartPanning(e);
+                    e.Handled = true;
+                    return;
+                }
+
                 try
                 {
                     // 交给系统拖动，移动过程平滑且能跨屏
@@ -1579,6 +1724,103 @@ namespace WordPictureAddIn
 
             RefreshToolbarPlacement();
             e.Handled = true;
+        }
+
+        /// <summary>当前缩放下的内容是否大于视口的任一方向。</summary>
+        private bool HasOverflowingContent()
+        {
+            if (_baseImageWidth <= 0d || _baseImageHeight <= 0d)
+            {
+                return false;
+            }
+
+            var viewportWidth = Width - (ContentOffset * 2.0d);
+            var viewportHeight = Height - (ContentOffset * 2.0d);
+
+            // 窗口尺寸尚未确定（首次布局）时回退到工作区尺寸。
+            if (double.IsNaN(viewportWidth) || double.IsNaN(viewportHeight) ||
+                viewportWidth <= 0d || viewportHeight <= 0d)
+            {
+                var workspace = GetWindowWorkspace();
+                viewportWidth = GetMaxViewportWidth(workspace);
+                viewportHeight = GetMaxViewportHeight(workspace);
+            }
+
+            return (_baseImageWidth * _zoom) > viewportWidth + 0.01d ||
+                   (_baseImageHeight * _zoom) > viewportHeight + 0.01d;
+        }
+
+        private void StartPanning(MouseButtonEventArgs e)
+        {
+            _isPanning = true;
+            _panStartMouse = e.GetPosition(this);
+            _panStartOffsetX = _panX;
+            _panStartOffsetY = _panY;
+
+            BeginImageInteraction();
+            CaptureMouse();
+            ImageCanvas.Cursor = Cursors.ScrollAll;
+        }
+
+        private void Window_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (!_isPanning)
+            {
+                return;
+            }
+
+            if (e.LeftButton != MouseButtonState.Pressed)
+            {
+                EndPanning();
+                return;
+            }
+
+            var current = e.GetPosition(this);
+            var viewportWidth = Width - (ContentOffset * 2.0d);
+            var viewportHeight = Height - (ContentOffset * 2.0d);
+
+            _panX = ClampPan(
+                _panStartOffsetX + (current.X - _panStartMouse.X),
+                viewportWidth,
+                _baseImageWidth * _zoom);
+            _panY = ClampPan(
+                _panStartOffsetY + (current.Y - _panStartMouse.Y),
+                viewportHeight,
+                _baseImageHeight * _zoom);
+
+            ContentPanTransform.X = _panX;
+            ContentPanTransform.Y = _panY;
+            e.Handled = true;
+        }
+
+        private void Window_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (!_isPanning)
+            {
+                return;
+            }
+
+            EndPanning();
+            e.Handled = true;
+        }
+
+        private void Window_LostMouseCapture(object sender, MouseEventArgs e)
+        {
+            if (!_isPanning)
+            {
+                return;
+            }
+
+            EndPanning();
+        }
+
+        private void EndPanning()
+        {
+            _isPanning = false;
+            ReleaseMouseCapture();
+            EndImageInteraction();
+            UpdateCursorVisual();
+            RefreshToolbarPlacement();
         }
 
         private void AnnotationCanvas_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -2065,7 +2307,8 @@ namespace WordPictureAddIn
             switch (_currentTool)
             {
                 case AnnotationTool.None:
-                    cursor = Cursors.SizeAll;
+                    // 内容超出视口时左键拖动的是图片，用滚动光标区分于拖窗口。
+                    cursor = HasOverflowingContent() ? Cursors.ScrollAll : Cursors.SizeAll;
                     break;
                 case AnnotationTool.Text:
                     cursor = Cursors.IBeam;
