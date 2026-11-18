@@ -95,6 +95,7 @@ scripts\Diagnose-AddIn.cmd Release
 5. 环境信息：.NET Framework、VSTO 运行时、Office 版本与位数、`WINWORD.EXE` 路径与文件版本
 6. 输出目录必需文件是否存在、是否有文件带网络来源锁定
 7. 加载项自身日志 `%LOCALAPPDATA%\WordPictureAddIn\addin.log` 的最近 40 行
+   （该日志**只保留最近一次启动**的内容，每次打开 Word 都会覆盖上一次的记录）
 8. VSTO 错误提示开关状态
 
 想看到 VSTO 的真实报错（默认是静默失败，什么都看不到）：
@@ -133,6 +134,8 @@ scripts\Unregister-AddIn.cmd
 - **加载项出现在 COM 加载项列表，但被 Word 自动禁用**：通常是加载过程抛异常。
   本项目已把 `ThisAddIn_Startup` 整体包在 `try/catch` 中，异常只记日志、不再向外抛，
   因此不会再被 Word 判定为「加载失败」而禁用。查看 `%LOCALAPPDATA%\WordPictureAddIn\addin.log` 定位原因。
+- **日志里看不到上一次的问题记录**：日志只保留最近一次启动的内容，重新打开 Word 就会覆盖。
+  排查时请在复现问题后**先看日志、再关 Word**，或者先把 `addin.log` 复制出来留存。
 - **提示清单签名无效**：本项目使用自签名证书。若换机器，需要重新生成 `WordPictureAddIn_TemporaryKey.pfx`，
   并把证书指纹写入 [`WordPictureAddIn.csproj`](../WordPictureAddIn.csproj) 的 `ManifestCertificateThumbprint`，
   然后重新编译（`Rebuild`），否则清单与 dll 的哈希不匹配。
