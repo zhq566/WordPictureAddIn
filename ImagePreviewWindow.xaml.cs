@@ -24,9 +24,23 @@ namespace WordPictureAddIn
         private const double ZoomStepFactor = 1.1d;
         private const double MinZoom = 0.1d;
         private const double MaxZoom = 8.0d;
-        private const double AnnotationStrokeThickness = 3.0d;
+        private const string DefaultAnnotationColor = "#FF4500";
+        private const double DefaultAnnotationStrokeWidth = 4.0d;
+        private const double DefaultAnnotationFontSize = 20.0d;
+        private const double MinAnnotationStrokeWidth = 1.0d;
+        private const double MaxAnnotationStrokeWidth = 12.0d;
+        private const double MinAnnotationFontSize = 12.0d;
+        private const double MaxAnnotationFontSize = 72.0d;
+        private const double TextBoxHorizontalPadding = 12.0d;
+        private const double TextBoxVerticalPadding = 8.0d;
         private const string DefaultBackgroundColor = "#C7EDCC";
         private const string TransparentBackgroundColor = "Transparent";
+
+        /// <summary>文字工具可选的字号档位。</summary>
+        private static readonly double[] AnnotationFontSizeSteps =
+        {
+            12.0d, 14.0d, 16.0d, 18.0d, 20.0d, 24.0d, 28.0d, 32.0d, 40.0d, 48.0d, 64.0d, 72.0d
+        };
 
         /// <summary>图片外围留给阴影的边距（DIP）。</summary>
         private const double ShadowMargin = 10.0d;
@@ -66,11 +80,22 @@ namespace WordPictureAddIn
         private DispatcherTimer _interactionEndTimer;
         private DispatcherTimer _toolbarHideTimer;
 
+        /// <summary>当前标注颜色，从设置读取，修改后立即持久化。</summary>
+        private Color _annotationColor;
+        private double _annotationStrokeWidth = DefaultAnnotationStrokeWidth;
+        private double _annotationFontSize = DefaultAnnotationFontSize;
+
         public ImagePreviewWindow()
         {
             InitializeComponent();
+
+            _annotationColor = LoadSavedAnnotationColor();
+            _annotationStrokeWidth = ClampStrokeWidth(LoadSavedAnnotationStrokeWidth());
+            _annotationFontSize = NormalizeFontSize(LoadSavedAnnotationFontSize());
+
             UpdateCursorVisual();
             ApplyBackgroundColor(LoadSavedBackgroundColor());
+            UpdateToolOptionsPanel();
         }
 
         /// <summary>
@@ -572,15 +597,17 @@ namespace WordPictureAddIn
 
         private void Window_Deactivated(object sender, EventArgs e)
         {
-            CommitOrCancelTextEditing();
-
-            // 切换到 Word 或其他程序时工具栏不应继续浮在最上层；
-            // 但要留出时间给工具栏按钮的点击处理（点击按钮同样会触发失活）。
+            // 点击工具栏按钮（尤其是参数行的色块 / 字号按钮）同样会触发失活。
+            // 此时不能提交文字编辑，否则"编辑中改样式"就没机会生效了。
             if (IsMouseOverToolbar())
             {
                 return;
             }
 
+            CommitOrCancelTextEditing();
+
+            // 切换到 Word 或其他程序时工具栏不应继续浮在最上层；
+            // 但要留出时间给工具栏按钮的点击处理。
             if (ShouldKeepToolbarVisible())
             {
                 return;
@@ -596,9 +623,17 @@ namespace WordPictureAddIn
         {
             try
             {
-                if (IsVisible)
+                if (!IsVisible)
                 {
-                    Activate();
+                    return;
+                }
+
+                Activate();
+
+                // 正在编辑文字时，把焦点还给输入框，否则用户改完参数就无法继续打字。
+                if (_activeTextEditor != null)
+                {
+                    _activeTextEditor.Focus();
                 }
             }
             catch
@@ -873,6 +908,304 @@ namespace WordPictureAddIn
             }
         }
 
+        #region 标注参数（颜色 / 线宽 / 字号）
+
+        private static Color LoadSavedAnnotationColor()
+        {
+            try
+            {
+                var parsed = ParseColor(Settings.Default.AnnotationColor);
+                if (parsed.HasValue)
+                {
+                    return parsed.Value;
+                }
+            }
+            catch
+            {
+            }
+
+            return ParseColor(DefaultAnnotationColor).Value;
+        }
+
+        private static double LoadSavedAnnotationStrokeWidth()
+        {
+            try
+            {
+                return Settings.Default.AnnotationStrokeWidth;
+            }
+            catch
+            {
+                return DefaultAnnotationStrokeWidth;
+            }
+        }
+
+        private static double LoadSavedAnnotationFontSize()
+        {
+            try
+            {
+                return Settings.Default.AnnotationFontSize;
+            }
+            catch
+            {
+                return DefaultAnnotationFontSize;
+            }
+        }
+
+        private static double ClampStrokeWidth(double width)
+        {
+            if (double.IsNaN(width) || width <= 0d)
+            {
+                return DefaultAnnotationStrokeWidth;
+            }
+
+            return Math.Max(MinAnnotationStrokeWidth, Math.Min(MaxAnnotationStrokeWidth, width));
+        }
+
+        /// <summary>把任意字号对齐到最接近的预设档位。</summary>
+        private static double NormalizeFontSize(double fontSize)
+        {
+            if (double.IsNaN(fontSize) || fontSize <= 0d)
+            {
+                return DefaultAnnotationFontSize;
+            }
+
+            var clamped = Math.Max(MinAnnotationFontSize, Math.Min(MaxAnnotationFontSize, fontSize));
+            var best = AnnotationFontSizeSteps[0];
+            var bestDelta = Math.Abs(clamped - best);
+
+            foreach (var step in AnnotationFontSizeSteps)
+            {
+                var delta = Math.Abs(clamped - step);
+                if (delta < bestDelta)
+                {
+                    best = step;
+                    bestDelta = delta;
+                }
+            }
+
+            return best;
+        }
+
+        private void SaveAnnotationOptions()
+        {
+            try
+            {
+                Settings.Default.AnnotationColor = ToHexString(_annotationColor);
+                Settings.Default.AnnotationStrokeWidth = _annotationStrokeWidth;
+                Settings.Default.AnnotationFontSize = _annotationFontSize;
+                Settings.Default.Save();
+            }
+            catch
+            {
+            }
+        }
+
+        private static string ToHexString(Color color)
+        {
+            return string.Format("#{0:X2}{1:X2}{2:X2}", color.R, color.G, color.B);
+        }
+
+        /// <summary>按当前工具切换参数行以及线宽/字号子面板的可见性。</summary>
+        private void UpdateToolOptionsPanel()
+        {
+            if (ToolOptionsPanel == null)
+            {
+                return;
+            }
+
+            var hasTool = _currentTool != AnnotationTool.None;
+            ToolOptionsPanel.Visibility = hasTool ? Visibility.Visible : Visibility.Collapsed;
+
+            var isText = _currentTool == AnnotationTool.Text;
+            StrokeWidthPanel.Visibility = hasTool && !isText ? Visibility.Visible : Visibility.Collapsed;
+            FontSizePanel.Visibility = hasTool && isText ? Visibility.Visible : Visibility.Collapsed;
+
+            if (hasTool)
+            {
+                UpdateAnnotationColorSelection();
+                UpdateStrokeWidthSelection();
+                UpdateFontSizeSelection();
+            }
+
+            RefreshToolbarPlacement();
+        }
+
+        private void UpdateAnnotationColorSelection()
+        {
+            if (AnnotationColorPanel == null)
+            {
+                return;
+            }
+
+            var current = ToHexString(_annotationColor);
+
+            foreach (var child in AnnotationColorPanel.Children)
+            {
+                var swatch = child as Button;
+                if (swatch == null)
+                {
+                    continue;
+                }
+
+                var tag = swatch.Tag as string;
+                var isCurrent = tag != null && string.Equals(tag, current, StringComparison.OrdinalIgnoreCase);
+                swatch.BorderBrush = isCurrent
+                    ? CreateFrozenBrush(Color.FromRgb(0x37, 0x41, 0x51))
+                    : CreateFrozenBrush(Color.FromRgb(0xD0, 0xD4, 0xDA));
+                swatch.BorderThickness = new Thickness(isCurrent ? 2 : 1);
+            }
+        }
+
+        private void UpdateStrokeWidthSelection()
+        {
+            var width = (int)Math.Round(_annotationStrokeWidth);
+            SetStrokeWidthButtonState(ThinStrokeButton, width == 2);
+            SetStrokeWidthButtonState(MediumStrokeButton, width == 4);
+            SetStrokeWidthButtonState(ThickStrokeButton, width == 6);
+        }
+
+        private static void SetStrokeWidthButtonState(ToggleButton button, bool isChecked)
+        {
+            if (button == null)
+            {
+                return;
+            }
+
+            button.IsChecked = isChecked;
+        }
+
+        private void UpdateFontSizeSelection()
+        {
+            if (FontSizeValueText != null)
+            {
+                FontSizeValueText.Text = ((int)Math.Round(_annotationFontSize)).ToString();
+            }
+
+            var atMin = _annotationFontSize <= AnnotationFontSizeSteps[0] + 0.01d;
+            var atMax = _annotationFontSize >= AnnotationFontSizeSteps[AnnotationFontSizeSteps.Length - 1] - 0.01d;
+            if (FontSizeDecreaseButton != null)
+            {
+                FontSizeDecreaseButton.IsEnabled = !atMin;
+                FontSizeDecreaseButton.Opacity = atMin ? 0.35d : 1.0d;
+            }
+
+            if (FontSizeIncreaseButton != null)
+            {
+                FontSizeIncreaseButton.IsEnabled = !atMax;
+                FontSizeIncreaseButton.Opacity = atMax ? 0.35d : 1.0d;
+            }
+        }
+
+        private void AnnotationColorSwatch_Click(object sender, RoutedEventArgs e)
+        {
+            var swatch = sender as Button;
+            var tag = swatch == null ? null : swatch.Tag as string;
+            var color = ParseColor(tag);
+            if (!color.HasValue)
+            {
+                return;
+            }
+
+            _annotationColor = color.Value;
+            SaveAnnotationOptions();
+            UpdateAnnotationColorSelection();
+            ApplyAnnotationStyleToActiveTextEditor();
+            ToolbarActionCompleted();
+        }
+
+        private void StrokeWidthButton_Click(object sender, RoutedEventArgs e)
+        {
+            var button = sender as ToggleButton;
+            if (button == null)
+            {
+                return;
+            }
+
+            double width;
+            if (!double.TryParse((button.Tag as string) ?? string.Empty, out width))
+            {
+                return;
+            }
+
+            _annotationStrokeWidth = ClampStrokeWidth(width);
+            SaveAnnotationOptions();
+            UpdateStrokeWidthSelection();
+            ToolbarActionCompleted();
+        }
+
+        private void FontSizeDecreaseButton_Click(object sender, RoutedEventArgs e)
+        {
+            StepAnnotationFontSize(-1);
+        }
+
+        private void FontSizeIncreaseButton_Click(object sender, RoutedEventArgs e)
+        {
+            StepAnnotationFontSize(1);
+        }
+
+        private void StepAnnotationFontSize(int direction)
+        {
+            var index = Array.FindIndex(AnnotationFontSizeSteps, s => Math.Abs(s - _annotationFontSize) < 0.01d);
+            if (index < 0)
+            {
+                index = Array.FindIndex(AnnotationFontSizeSteps, s => s >= _annotationFontSize);
+                if (index < 0)
+                {
+                    index = AnnotationFontSizeSteps.Length - 1;
+                }
+
+                if (direction < 0)
+                {
+                    index = Math.Max(0, index - 1);
+                }
+            }
+            else
+            {
+                index = Math.Max(0, Math.Min(AnnotationFontSizeSteps.Length - 1, index + direction));
+            }
+
+            _annotationFontSize = AnnotationFontSizeSteps[index];
+            SaveAnnotationOptions();
+            UpdateFontSizeSelection();
+            ApplyAnnotationStyleToActiveTextEditor();
+            ToolbarActionCompleted();
+        }
+
+        /// <summary>正在编辑的文字立即应用当前颜色与字号，并同步调整输入框尺寸。</summary>
+        private void ApplyAnnotationStyleToActiveTextEditor()
+        {
+            if (_activeTextEditor == null || _activeTextEditorContainer == null)
+            {
+                return;
+            }
+
+            var brush = CreateFrozenBrush(_annotationColor);
+            _activeTextEditor.Foreground = brush;
+            _activeTextEditor.CaretBrush = brush;
+            _activeTextEditor.FontSize = _annotationFontSize;
+
+            _activeTextEditorContainer.MinHeight = GetTextContainerMinHeight(_annotationFontSize);
+            _activeTextEditorContainer.Width = GetTextContainerWidth(_annotationFontSize);
+        }
+
+        private static double GetTextContainerMinHeight(double fontSize)
+        {
+            return (fontSize * 1.6d) + TextBoxVerticalPadding;
+        }
+
+        private static double GetTextContainerWidth(double fontSize)
+        {
+            return Math.Max(200.0d, fontSize * 10.0d);
+        }
+
+        /// <summary>新建标注时使用的冻结画刷。</summary>
+        private Brush CreateAnnotationBrush()
+        {
+            return CreateFrozenBrush(_annotationColor);
+        }
+
+        #endregion
+
         private void SaveButton_Click(object sender, RoutedEventArgs e)
         {
             CommitOrCancelTextEditing();
@@ -960,7 +1293,7 @@ namespace WordPictureAddIn
         {
             if (element is Line line)
             {
-                using (var pen = CreateDrawingPen(scaleX))
+                using (var pen = CreateDrawingPen(line.Stroke, line.StrokeThickness, scaleX))
                 {
                     graphics.DrawLine(
                         pen,
@@ -975,7 +1308,7 @@ namespace WordPictureAddIn
 
             if (element is Rectangle rectangle)
             {
-                using (var pen = CreateDrawingPen(scaleX))
+                using (var pen = CreateDrawingPen(rectangle.Stroke, rectangle.StrokeThickness, scaleX))
                 {
                     var left = Canvas.GetLeft(rectangle) * scaleX;
                     var top = Canvas.GetTop(rectangle) * scaleY;
@@ -989,7 +1322,7 @@ namespace WordPictureAddIn
 
             if (element is Ellipse ellipse)
             {
-                using (var pen = CreateDrawingPen(scaleX))
+                using (var pen = CreateDrawingPen(ellipse.Stroke, ellipse.StrokeThickness, scaleX))
                 {
                     var left = Canvas.GetLeft(ellipse) * scaleX;
                     var top = Canvas.GetTop(ellipse) * scaleY;
@@ -1021,7 +1354,7 @@ namespace WordPictureAddIn
                 return;
             }
 
-            using (var pen = CreateDrawingPen(scaleX))
+            using (var pen = CreateDrawingPen(path.Stroke, path.StrokeThickness, scaleX))
             {
                 foreach (var child in geometry.Children)
                 {
@@ -1049,13 +1382,24 @@ namespace WordPictureAddIn
             var top = Canvas.GetTop(grid);
             var width = grid.Width;
 
-            using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.OrangeRed))
-            using (var font = new System.Drawing.Font("Microsoft YaHei UI", (float)(24 * scaleY), System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Pixel))
+            // 颜色和字号都取自 TextBlock 自身，界面与导出保持一致。
+            var textColor = textBlock.Foreground is SolidColorBrush solid
+                ? System.Drawing.Color.FromArgb(
+                    textBlock.Opacity >= 1.0d ? solid.Color.A : (byte)(solid.Color.A * textBlock.Opacity),
+                    solid.Color.R,
+                    solid.Color.G,
+                    solid.Color.B)
+                : System.Drawing.Color.OrangeRed;
+
+            var fontSize = (float)(Math.Max(1.0d, textBlock.FontSize) * scaleY);
+
+            using (var brush = new System.Drawing.SolidBrush(textColor))
+            using (var font = new System.Drawing.Font("Microsoft YaHei UI", fontSize, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Pixel))
             {
                 var layoutRect = new System.Drawing.RectangleF(
-                    (float)((left + 8) * scaleX),
-                    (float)((top + 6) * scaleY),
-                    (float)Math.Max(1, (width - 16) * scaleX),
+                    (float)((left + TextBoxHorizontalPadding / 2.0d) * scaleX),
+                    (float)((top + TextBoxVerticalPadding / 2.0d) * scaleY),
+                    (float)Math.Max(1, (width - TextBoxHorizontalPadding) * scaleX),
                     10000f);
 
                 var format = new System.Drawing.StringFormat
@@ -1068,15 +1412,20 @@ namespace WordPictureAddIn
             }
         }
 
-        private static System.Drawing.Pen CreateDrawingPen(double scale)
+        /// <summary>按标注元素自身的颜色与线宽创建 GDI+ 画笔，导出时与界面保持一致。</summary>
+        private static System.Drawing.Pen CreateDrawingPen(Brush stroke, double thickness, double scale)
         {
-            var pen = new System.Drawing.Pen(System.Drawing.Color.OrangeRed, (float)Math.Max(1.0d, AnnotationStrokeThickness * scale))
+            var drawingColor = stroke is SolidColorBrush solid
+                ? System.Drawing.Color.FromArgb(solid.Color.A, solid.Color.R, solid.Color.G, solid.Color.B)
+                : System.Drawing.Color.OrangeRed;
+
+            var penWidth = Math.Max(1.0d, thickness * scale);
+            return new System.Drawing.Pen(drawingColor, (float)penWidth)
             {
                 StartCap = System.Drawing.Drawing2D.LineCap.Round,
                 EndCap = System.Drawing.Drawing2D.LineCap.Round,
                 LineJoin = System.Drawing.Drawing2D.LineJoin.Round
             };
-            return pen;
         }
 
         private void ToolButton_Click(object sender, RoutedEventArgs e)
@@ -1101,6 +1450,7 @@ namespace WordPictureAddIn
                 _currentTool = AnnotationTool.None;
                 AnnotationCanvas.IsHitTestVisible = false;
                 UpdateCursorVisual();
+                UpdateToolOptionsPanel();
                 ScheduleToolbarHide();
                 return;
             }
@@ -1129,6 +1479,7 @@ namespace WordPictureAddIn
 
             AnnotationCanvas.IsHitTestVisible = _currentTool != AnnotationTool.None;
             UpdateCursorVisual();
+            UpdateToolOptionsPanel();
             ShowToolbar();
         }
 
@@ -1304,19 +1655,23 @@ namespace WordPictureAddIn
             SetToolButtonState(ArrowToolButton, false);
             SetToolButtonState(TextToolButton, false);
             UpdateCursorVisual();
+            UpdateToolOptionsPanel();
         }
 
         private void CreatePreviewAnnotation(Point point)
         {
             RemovePreviewAnnotation();
 
+            var stroke = CreateAnnotationBrush();
+            var thickness = _annotationStrokeWidth;
+
             switch (_currentTool)
             {
                 case AnnotationTool.Line:
                     _previewShape = new Line
                     {
-                        Stroke = Brushes.OrangeRed,
-                        StrokeThickness = AnnotationStrokeThickness,
+                        Stroke = stroke,
+                        StrokeThickness = thickness,
                         X1 = point.X,
                         Y1 = point.Y,
                         X2 = point.X,
@@ -1327,8 +1682,8 @@ namespace WordPictureAddIn
                 case AnnotationTool.Rectangle:
                     _previewShape = new Rectangle
                     {
-                        Stroke = Brushes.OrangeRed,
-                        StrokeThickness = AnnotationStrokeThickness,
+                        Stroke = stroke,
+                        StrokeThickness = thickness,
                         Fill = Brushes.Transparent
                     };
                     AnnotationCanvas.Children.Add(_previewShape);
@@ -1336,8 +1691,8 @@ namespace WordPictureAddIn
                 case AnnotationTool.Ellipse:
                     _previewShape = new Ellipse
                     {
-                        Stroke = Brushes.OrangeRed,
-                        StrokeThickness = AnnotationStrokeThickness,
+                        Stroke = stroke,
+                        StrokeThickness = thickness,
                         Fill = Brushes.Transparent
                     };
                     AnnotationCanvas.Children.Add(_previewShape);
@@ -1345,8 +1700,8 @@ namespace WordPictureAddIn
                 case AnnotationTool.Arrow:
                     _previewArrow = new Path
                     {
-                        Stroke = Brushes.OrangeRed,
-                        StrokeThickness = AnnotationStrokeThickness,
+                        Stroke = stroke,
+                        StrokeThickness = thickness,
                         Fill = Brushes.Transparent
                     };
                     AnnotationCanvas.Children.Add(_previewArrow);
@@ -1379,7 +1734,7 @@ namespace WordPictureAddIn
                 case AnnotationTool.Arrow:
                     if (_previewArrow != null)
                     {
-                        _previewArrow.Data = BuildArrowGeometry(start, end);
+                        _previewArrow.Data = BuildArrowGeometry(start, end, _annotationStrokeWidth);
                     }
                     break;
             }
@@ -1394,13 +1749,16 @@ namespace WordPictureAddIn
                 return;
             }
 
+            var stroke = CreateAnnotationBrush();
+            var thickness = _annotationStrokeWidth;
+
             switch (_currentTool)
             {
                 case AnnotationTool.Line:
                     var line = new Line
                     {
-                        Stroke = Brushes.OrangeRed,
-                        StrokeThickness = AnnotationStrokeThickness,
+                        Stroke = stroke,
+                        StrokeThickness = thickness,
                         X1 = start.X,
                         Y1 = start.Y,
                         X2 = end.X,
@@ -1412,8 +1770,8 @@ namespace WordPictureAddIn
                 case AnnotationTool.Rectangle:
                     var rect = new Rectangle
                     {
-                        Stroke = Brushes.OrangeRed,
-                        StrokeThickness = AnnotationStrokeThickness,
+                        Stroke = stroke,
+                        StrokeThickness = thickness,
                         Fill = Brushes.Transparent
                     };
                     AnnotationCanvas.Children.Add(rect);
@@ -1423,8 +1781,8 @@ namespace WordPictureAddIn
                 case AnnotationTool.Ellipse:
                     var ellipse = new Ellipse
                     {
-                        Stroke = Brushes.OrangeRed,
-                        StrokeThickness = AnnotationStrokeThickness,
+                        Stroke = stroke,
+                        StrokeThickness = thickness,
                         Fill = Brushes.Transparent
                     };
                     AnnotationCanvas.Children.Add(ellipse);
@@ -1434,10 +1792,10 @@ namespace WordPictureAddIn
                 case AnnotationTool.Arrow:
                     var arrow = new Path
                     {
-                        Stroke = Brushes.OrangeRed,
-                        StrokeThickness = AnnotationStrokeThickness,
+                        Stroke = stroke,
+                        StrokeThickness = thickness,
                         Fill = Brushes.Transparent,
-                        Data = BuildArrowGeometry(start, end)
+                        Data = BuildArrowGeometry(start, end, thickness)
                     };
                     AnnotationCanvas.Children.Add(arrow);
                     _annotationHistory.Add(arrow);
@@ -1463,7 +1821,7 @@ namespace WordPictureAddIn
             shape.Height = height;
         }
 
-        private Geometry BuildArrowGeometry(Point start, Point end)
+        private Geometry BuildArrowGeometry(Point start, Point end, double strokeWidth)
         {
             var group = new GeometryGroup();
             group.Children.Add(new LineGeometry(start, end));
@@ -1478,8 +1836,10 @@ namespace WordPictureAddIn
 
             var ux = dx / length;
             var uy = dy / length;
-            var arrowLength = 14.0d;
-            var arrowWidth = 6.0d;
+
+            // 箭头头部随线宽放大，避免粗线配小箭头。
+            var arrowLength = Math.Max(14.0d, strokeWidth * 4.0d);
+            var arrowWidth = Math.Max(6.0d, strokeWidth * 2.0d);
 
             var left = new Point(
                 end.X - arrowLength * ux + arrowWidth * uy,
@@ -1547,10 +1907,13 @@ namespace WordPictureAddIn
         {
             CommitOrCancelTextEditing();
 
+            var brush = CreateAnnotationBrush();
+            var fontSize = _annotationFontSize;
+
             var container = new Grid
             {
-                Width = 200,
-                Height = 48
+                Width = GetTextContainerWidth(fontSize),
+                MinHeight = GetTextContainerMinHeight(fontSize)
             };
 
             var rectangle = new Rectangle
@@ -1567,15 +1930,15 @@ namespace WordPictureAddIn
             {
                 BorderThickness = new Thickness(0),
                 Background = Brushes.Transparent,
-                Foreground = Brushes.OrangeRed,
+                Foreground = brush,
                 FontFamily = new FontFamily("Microsoft YaHei UI"),
-                FontSize = 20,
+                FontSize = fontSize,
                 FontWeight = FontWeights.Bold,
                 AcceptsReturn = true,
                 TextWrapping = TextWrapping.Wrap,
                 VerticalContentAlignment = VerticalAlignment.Center,
                 Padding = new Thickness(6, 4, 6, 4),
-                CaretBrush = Brushes.OrangeRed
+                CaretBrush = brush
             };
 
             container.Children.Add(rectangle);
@@ -1607,15 +1970,16 @@ namespace WordPictureAddIn
 
             if (!string.IsNullOrWhiteSpace(text))
             {
+                // 沿用输入框当前的样式，避免提交瞬间颜色或字号跳变。
+                // 不设 Width，让 TextBlock 自动填满容器；Margin 与 TextBox 的 Padding 对齐即可保证换行宽度一致。
                 var textBlock = new TextBlock
                 {
                     Text = text,
-                    Foreground = Brushes.OrangeRed,
-                    FontFamily = new FontFamily("Microsoft YaHei UI"),
-                    FontSize = 20,
-                    FontWeight = FontWeights.Bold,
+                    Foreground = _activeTextEditor.Foreground,
+                    FontFamily = _activeTextEditor.FontFamily,
+                    FontSize = _activeTextEditor.FontSize,
+                    FontWeight = _activeTextEditor.FontWeight,
                     TextWrapping = TextWrapping.Wrap,
-                    Width = _activeTextEditorContainer.Width,
                     Margin = new Thickness(6, 4, 6, 4)
                 };
 

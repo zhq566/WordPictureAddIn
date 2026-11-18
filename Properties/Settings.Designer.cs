@@ -34,5 +34,41 @@ namespace WordPictureAddIn.Properties {
                 this["PreviewBackgroundColor"] = value;
             }
         }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("#FF4500")]
+        public string AnnotationColor {
+            get {
+                return ((string)(this["AnnotationColor"]));
+            }
+            set {
+                this["AnnotationColor"] = value;
+            }
+        }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("4")]
+        public double AnnotationStrokeWidth {
+            get {
+                return ((double)(this["AnnotationStrokeWidth"]));
+            }
+            set {
+                this["AnnotationStrokeWidth"] = value;
+            }
+        }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("20")]
+        public double AnnotationFontSize {
+            get {
+                return ((double)(this["AnnotationFontSize"]));
+            }
+            set {
+                this["AnnotationFontSize"] = value;
+            }
+        }
     }
 }

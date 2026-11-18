@@ -96,6 +96,98 @@
             </Setter>
         </Style>
 
+        <!-- 参数行：标注颜色色块（BorderBrush/BorderThickness 由代码设置选中态） -->
+        <Style x:Key="AnnotationSwatchStyle" TargetType="Button">
+            <Setter Property="Width" Value="22"/>
+            <Setter Property="Height" Value="22"/>
+            <Setter Property="Margin" Value="2,0"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="BorderBrush" Value="#D0D4DA"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="SwatchBorder"
+                                CornerRadius="6"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="SwatchBorder" Property="BorderBrush" Value="#4B5563"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 参数行：线宽选择（内容为不同粗细的横线） -->
+        <Style x:Key="StrokeWidthToggleStyle" TargetType="ToggleButton">
+            <Setter Property="Width" Value="30"/>
+            <Setter Property="Height" Value="24"/>
+            <Setter Property="Margin" Value="2,0"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToggleButton">
+                        <Border x:Name="ButtonBorder"
+                                Background="Transparent"
+                                BorderBrush="Transparent"
+                                BorderThickness="1"
+                                CornerRadius="7">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="Background" Value="#EEF1F4"/>
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="Background" Value="#E7EEF9"/>
+                                <Setter TargetName="ButtonBorder" Property="BorderBrush" Value="#93B4E8"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 参数行：字号加减按钮 -->
+        <Style x:Key="FontSizeStepButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="24"/>
+            <Setter Property="Height" Value="24"/>
+            <Setter Property="Margin" Value="2,0"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="ButtonBorder"
+                                Background="Transparent"
+                                BorderBrush="#E1E4E8"
+                                BorderThickness="1"
+                                CornerRadius="7">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="Background" Value="#EEF1F4"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="Background" Value="#E7EEF9"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <Style x:Key="ToolToggleStyle" TargetType="ToggleButton">
             <Setter Property="Width" Value="36"/>
             <Setter Property="Height" Value="32"/>
@@ -199,6 +291,7 @@
                                       RenderingBias="Performance"/>
                 </Border.Effect>
 
+                <StackPanel Orientation="Vertical">
                 <StackPanel Orientation="Horizontal">
                     <ToggleButton x:Name="LineToolButton"
                                   Style="{StaticResource ToolToggleStyle}"
@@ -411,6 +504,142 @@
                             </StackPanel>
                         </Border>
                     </Popup>
+                </StackPanel>
+
+                <!-- 参数行：仅在选择标注工具时显示 -->
+                <StackPanel x:Name="ToolOptionsPanel" Visibility="Collapsed">
+                    <Border Height="1"
+                            Margin="0,4,0,6"
+                            Background="#EDEFF2"/>
+
+                    <StackPanel Orientation="Horizontal">
+                        <!-- 颜色色块 -->
+                        <StackPanel x:Name="AnnotationColorPanel" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock Text="颜色"
+                                       Margin="2,0,4,0"
+                                       VerticalAlignment="Center"
+                                       FontFamily="Microsoft YaHei UI"
+                                       FontSize="12"
+                                       Foreground="#6B7280"/>
+                            <Button Style="{StaticResource AnnotationSwatchStyle}"
+                                    Background="#FF4500"
+                                    Tag="#FF4500"
+                                    ToolTip="橙红"
+                                    Click="AnnotationColorSwatch_Click"/>
+                            <Button Style="{StaticResource AnnotationSwatchStyle}"
+                                    Background="#E53935"
+                                    Tag="#E53935"
+                                    ToolTip="红"
+                                    Click="AnnotationColorSwatch_Click"/>
+                            <Button Style="{StaticResource AnnotationSwatchStyle}"
+                                    Background="#FBC02D"
+                                    Tag="#FBC02D"
+                                    ToolTip="黄"
+                                    Click="AnnotationColorSwatch_Click"/>
+                            <Button Style="{StaticResource AnnotationSwatchStyle}"
+                                    Background="#43A047"
+                                    Tag="#43A047"
+                                    ToolTip="绿"
+                                    Click="AnnotationColorSwatch_Click"/>
+                            <Button Style="{StaticResource AnnotationSwatchStyle}"
+                                    Background="#1E88E5"
+                                    Tag="#1E88E5"
+                                    ToolTip="蓝"
+                                    Click="AnnotationColorSwatch_Click"/>
+                            <Button Style="{StaticResource AnnotationSwatchStyle}"
+                                    Background="#8E24AA"
+                                    Tag="#8E24AA"
+                                    ToolTip="紫"
+                                    Click="AnnotationColorSwatch_Click"/>
+                            <Button Style="{StaticResource AnnotationSwatchStyle}"
+                                    Background="#000000"
+                                    Tag="#000000"
+                                    ToolTip="黑"
+                                    Click="AnnotationColorSwatch_Click"/>
+                            <Button Style="{StaticResource AnnotationSwatchStyle}"
+                                    Background="#FFFFFF"
+                                    Tag="#FFFFFF"
+                                    ToolTip="白"
+                                    Click="AnnotationColorSwatch_Click"/>
+                        </StackPanel>
+
+                        <Border x:Name="ToolOptionsSeparator"
+                                Width="1"
+                                Height="18"
+                                Margin="8,0"
+                                VerticalAlignment="Center"
+                                Background="#E1E4E8"/>
+
+                        <!-- 线宽（形状工具） -->
+                        <StackPanel x:Name="StrokeWidthPanel" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock Text="线宽"
+                                       Margin="2,0,4,0"
+                                       VerticalAlignment="Center"
+                                       FontFamily="Microsoft YaHei UI"
+                                       FontSize="12"
+                                       Foreground="#6B7280"/>
+                            <ToggleButton x:Name="ThinStrokeButton"
+                                          Style="{StaticResource StrokeWidthToggleStyle}"
+                                          Tag="2"
+                                          ToolTip="细"
+                                          Click="StrokeWidthButton_Click">
+                                <Rectangle Width="14" Height="2" Fill="#4B5563"/>
+                            </ToggleButton>
+                            <ToggleButton x:Name="MediumStrokeButton"
+                                          Style="{StaticResource StrokeWidthToggleStyle}"
+                                          Tag="4"
+                                          ToolTip="中"
+                                          Click="StrokeWidthButton_Click">
+                                <Rectangle Width="14" Height="4" Fill="#4B5563"/>
+                            </ToggleButton>
+                            <ToggleButton x:Name="ThickStrokeButton"
+                                          Style="{StaticResource StrokeWidthToggleStyle}"
+                                          Tag="6"
+                                          ToolTip="粗"
+                                          Click="StrokeWidthButton_Click">
+                                <Rectangle Width="14" Height="6" Fill="#4B5563"/>
+                            </ToggleButton>
+                        </StackPanel>
+
+                        <!-- 字号（文字工具） -->
+                        <StackPanel x:Name="FontSizePanel" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock Text="字号"
+                                       Margin="2,0,4,0"
+                                       VerticalAlignment="Center"
+                                       FontFamily="Microsoft YaHei UI"
+                                       FontSize="12"
+                                       Foreground="#6B7280"/>
+                            <Button x:Name="FontSizeDecreaseButton"
+                                    Style="{StaticResource FontSizeStepButtonStyle}"
+                                    Click="FontSizeDecreaseButton_Click"
+                                    ToolTip="减小字号">
+                                <TextBlock Text="A−"
+                                           FontFamily="Microsoft YaHei UI"
+                                           FontSize="12"
+                                           FontWeight="SemiBold"
+                                           Foreground="#4B5563"/>
+                            </Button>
+                            <TextBlock x:Name="FontSizeValueText"
+                                       Width="30"
+                                       Text="20"
+                                       TextAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       FontFamily="Microsoft YaHei UI"
+                                       FontSize="12"
+                                       Foreground="#374151"/>
+                            <Button x:Name="FontSizeIncreaseButton"
+                                    Style="{StaticResource FontSizeStepButtonStyle}"
+                                    Click="FontSizeIncreaseButton_Click"
+                                    ToolTip="增大字号">
+                                <TextBlock Text="A+"
+                                           FontFamily="Microsoft YaHei UI"
+                                           FontSize="13"
+                                           FontWeight="SemiBold"
+                                           Foreground="#4B5563"/>
+                            </Button>
+                        </StackPanel>
+                    </StackPanel>
+                </StackPanel>
                 </StackPanel>
             </Border>
         </Popup>
