@@ -26,6 +26,33 @@
 
 <img width="800" height="500" alt="预览界面" src="https://github.com/user-attachments/assets/bcb44427-f1a3-42f5-baaa-94712c222dbd" />
 
+## 兼容性
+
+| 项目 | 要求 |
+|---|---|
+| Word | **Word 2010 及以上**（2010 / 2013 / 2016 / 2019 / 2021 / 365） |
+| Office 位数 | 32 位与 64 位均可（加载项为 `AnyCPU`，同一份输出通用） |
+| Word 2007 及更早 | **不支持**（无法加载 VSTO 4.0 加载项） |
+| WPS Office | **不支持**（WPS 不加载 VSTO 加载项） |
+| Windows | Windows 7 SP1 及以上 |
+| .NET Framework | **4.7.2 及以上**（无需 4.8） |
+| VSTO 运行时 | 需要 Microsoft Visual Studio 2010 Tools for Office Runtime |
+| Office PIA | **不需要**（已内嵌互操作类型） |
+
 ## 安装和卸载
 双击`setup.exe`即可安装，如遇到无法使用或者影响Word自身功能，通过设置里卸载。
 <img width="611" height="234" alt="image" src="https://github.com/user-attachments/assets/659ad924-87c4-45ae-aeb3-22438ef77ed1" />
+
+### 手动部署（无安装包时）
+使用 [`scripts`](scripts) 目录下的脚本，无需管理员权限：
+
+```cmd
+scripts\Register-AddIn.cmd Release     :: 注册（建议分发 Release 编译产物）
+scripts\Diagnose-AddIn.cmd Release     :: 加载失败时先跑这个，只读诊断
+scripts\Unregister-AddIn.cmd           :: 卸载
+```
+
+注册脚本会自动处理换机器部署最常见的三个坑：解除拷贝文件的「网络来源」锁定、
+写入 VSTO 信任列表（避免自签名证书被拦）、清理 Word 的「禁用项目」记录。
+
+排查方法详见 [`scripts/README.md`](scripts/README.md)。

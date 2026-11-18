@@ -30,16 +30,61 @@ namespace WordPictureAddIn
 
         private void ThisAddIn_Startup(object sender, EventArgs e)
         {
-            _isShuttingDown = false;
-            EnsureWpfApplication();
-            Application.WindowSelectionChange += Application_WindowSelectionChange;
-            Application.WindowBeforeDoubleClick += Application_WindowBeforeDoubleClick;
-            SchedulePreviewWindowPrewarm();
+            // 整个启动过程包在 try 中：任何异常都只记录日志、绝不向外抛出，
+            // 否则 VSTO 会把加载项标记为加载失败，Word 随后会静默禁用它。
+            try
+            {
+                WriteStartupDiagnostics();
+
+                _isShuttingDown = false;
+                EnsureWpfApplication();
+                Application.WindowSelectionChange += Application_WindowSelectionChange;
+                Application.WindowBeforeDoubleClick += Application_WindowBeforeDoubleClick;
+                SchedulePreviewWindowPrewarm();
+
+                AddInLog.Write("加载项启动完成。");
+            }
+            catch (Exception ex)
+            {
+                AddInLog.Error("加载项启动失败", ex);
+            }
+        }
+
+        /// <summary>把运行环境信息写入日志，便于在目标机上定位加载失败原因。</summary>
+        private void WriteStartupDiagnostics()
+        {
+            AddInLog.Write("==== 加载项启动 ====");
+            AddInLog.Write("日志文件: {0}", AddInLog.LogFilePath);
+
+            try
+            {
+                AddInLog.Write("操作系统: {0}", Environment.OSVersion);
+                AddInLog.Write(".NET 版本: {0}", Environment.Version);
+                AddInLog.Write("进程位数: {0}", Environment.Is64BitProcess ? "64 位" : "32 位");
+                AddInLog.Write("程序集版本: {0}", typeof(ThisAddIn).Assembly.GetName().Version);
+            }
+            catch (Exception ex)
+            {
+                AddInLog.Error("写入环境信息失败", ex);
+            }
+
+            try
+            {
+                AddInLog.Write("Word 版本: {0}", Application.Version);
+                AddInLog.Write("Word Build: {0}", Application.Build);
+                AddInLog.Write("Word 位数: {0}", Environment.Is64BitProcess ? "64 位" : "32 位");
+            }
+            catch (Exception ex)
+            {
+                AddInLog.Error("读取 Word 版本失败", ex);
+            }
         }
 
         private void ThisAddIn_Shutdown(object sender, EventArgs e)
         {
             _isShuttingDown = true;
+
+            AddInLog.Write("加载项开始卸载。");
 
             Application.WindowSelectionChange -= Application_WindowSelectionChange;
             Application.WindowBeforeDoubleClick -= Application_WindowBeforeDoubleClick;
@@ -72,8 +117,9 @@ namespace WordPictureAddIn
                 // 改为延迟防抖后预取，避免每次单击选中都阻塞 Word 界面线程。
                 ScheduleSelectionCapture(selectionKey);
             }
-            catch
+            catch (Exception ex)
             {
+                AddInLog.Error("Application_WindowSelectionChange 处理失败", ex);
             }
         }
 
@@ -145,8 +191,9 @@ namespace WordPictureAddIn
 
                 ReplaceCachedSelectionImage(selectionKey, image);
             }
-            catch
+            catch (Exception ex)
             {
+                AddInLog.Error("SelectionCaptureTimer_Tick 处理失败", ex);
             }
         }
 
@@ -183,8 +230,9 @@ namespace WordPictureAddIn
 
                 ShowPin(image);
             }
-            catch
+            catch (Exception ex)
             {
+                AddInLog.Error("Application_WindowBeforeDoubleClick 处理失败", ex);
             }
         }
 
@@ -300,8 +348,9 @@ namespace WordPictureAddIn
 
                 return ParseOriginalImageFromFlatOpc(flatOpcXml, expectedShapeName);
             }
-            catch
+            catch (Exception ex)
             {
+                AddInLog.Error("TryCaptureOriginalImageViaWordOpenXml 失败", ex);
                 return null;
             }
         }
@@ -1024,8 +1073,9 @@ namespace WordPictureAddIn
 
                 return croppedBitmap;
             }
-            catch
+            catch (Exception ex)
             {
+                AddInLog.Error("CropBitmapBySourceRectangle 失败，回退为整图", ex);
                 return new Bitmap(sourceBitmap);
             }
         }
@@ -1041,14 +1091,17 @@ namespace WordPictureAddIn
             {
                 window.SetImage(image);
             }
-            catch
+            catch (Exception ex)
             {
+                AddInLog.Error("ShowPin 设置图片失败", ex);
+
                 try
                 {
                     window.Close();
                 }
-                catch
+                catch (Exception closeEx)
                 {
+                    AddInLog.Error("ShowPin 关闭窗口失败", closeEx);
                 }
 
                 image.Dispose();
@@ -1084,8 +1137,9 @@ namespace WordPictureAddIn
                 copy.SetResolution(96f, 96f);
                 return copy;
             }
-            catch
+            catch (Exception ex)
             {
+                AddInLog.Error("TryCloneCachedSelectionImage 失败", ex);
                 return null;
             }
         }
@@ -1148,8 +1202,9 @@ namespace WordPictureAddIn
                 {
                     _sparePinWindow = CreatePinWindow();
                 }
-                catch
+                catch (Exception ex)
                 {
+                    AddInLog.Error("预热贴图窗口失败", ex);
                 }
             }));
         }
@@ -1213,8 +1268,9 @@ namespace WordPictureAddIn
                     window.Closed -= PinWindow_Closed;
                     window.Close();
                 }
-                catch
+                catch (Exception ex)
                 {
+                    AddInLog.Error("关闭贴图窗口失败", ex);
                 }
             }
 
@@ -1228,8 +1284,9 @@ namespace WordPictureAddIn
                     spare.Closed -= PinWindow_Closed;
                     spare.Close();
                 }
-                catch
+                catch (Exception ex)
                 {
+                    AddInLog.Error("关闭备用贴图窗口失败", ex);
                 }
             }
         }
