@@ -9,4 +9,5 @@ if not "%EXITCODE%"=="0" (
     echo.
     pause
 )
+pause
 exit /b %EXITCODE%

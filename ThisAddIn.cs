@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -8,25 +9,46 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Xml;
 using Microsoft.Office.Interop.Word;
-using System.Windows;
 
 namespace WordPictureAddIn
 {
     public partial class ThisAddIn
     {
-        private const double SelectionCaptureDelayMilliseconds = 260.0d;
+        /// <summary>选中图片后延迟抓图的防抖间隔，避免每次单击选中都阻塞 Word 界面线程。</summary>
+        private const int SelectionCaptureDelayMilliseconds = 260;
 
-        /// <summary>已贴出的贴图窗口，可同时存在多个。</summary>
-        private readonly List<ImagePreviewWindow> _pinWindows = new List<ImagePreviewWindow>();
+        /// <summary>启动诊断信息的延迟写入时间，避开 Word 启动的关键路径。</summary>
+        private const int StartupDiagnosticsDelayMilliseconds = 2000;
 
-        /// <summary>预先创建好的空闲贴图窗口，下次双击时直接复用，省去构造开销。</summary>
-        private ImagePreviewWindow _sparePinWindow;
+        /// <summary>
+        /// 首次选中图片后延迟多久才去初始化 WPF 并预热贴图窗口。
+        /// 留出这段间隔，用户的选中操作先完成，WPF 加载发生在随后的空闲时间。
+        /// </summary>
+        private const int PinPrewarmDelayMilliseconds = 400;
+
+        /// <summary>
+        /// 贴图窗口管理器。此处刻意使用延迟创建：
+        /// 本类在 Word 启动时就会被加载，如果字段直接引用 WPF 类型（窗口、Dispatcher 等），
+        /// CLR 在构建类型布局时就会连锁加载 PresentationFramework / PresentationCore / WindowsBase，
+        /// 这些程序集加上 XAML 解析和贴图窗口类自身的 JIT 是启动慢的主要来源之一。
+        /// 改为用户第一次真正选中图片时才创建管理器，启动路径上不触达任何 WPF 类型。
+        /// </summary>
+        private PinManager _pinManager;
 
         private string _cachedSelectionKey;
         private Image _cachedSelectionImage;
-        private System.Windows.Threading.DispatcherTimer _selectionCaptureTimer;
         private string _pendingSelectionKey;
         private bool _isShuttingDown;
+        private bool _startupDiagnosticsWritten;
+
+        /// <summary>是否已经请求过一次贴图窗口预热，避免每次选中图片都重新排队。</summary>
+        private bool _pinPrewarmRequested;
+
+        /// <summary>
+        /// 防抖计时器使用 WinForms 定时器而不是 WPF 的 DispatcherTimer：
+        /// 前者只依赖 Word 本来就有的消息循环，不需要先初始化 WPF Application。
+        /// </summary>
+        private System.Windows.Forms.Timer _selectionCaptureTimer;
 
         private void ThisAddIn_Startup(object sender, EventArgs e)
         {
@@ -34,15 +56,25 @@ namespace WordPictureAddIn
             // 否则 VSTO 会把加载项标记为加载失败，Word 随后会静默禁用它。
             try
             {
-                WriteStartupDiagnostics();
+                var stopwatch = Stopwatch.StartNew();
 
                 _isShuttingDown = false;
-                EnsureWpfApplication();
+                _startupDiagnosticsWritten = false;
+
+                AddInLog.Write("==== 加载项启动 ====");
+                AddInLog.Write("日志文件: {0}", AddInLog.LogFilePath);
+
+                // 启动阶段只做最小必要工作：注册两个事件。
+                // WPF 环境、贴图窗口预热、环境诊断全部推迟到首次使用 / 空闲时，避免拖慢 Word 启动。
                 Application.WindowSelectionChange += Application_WindowSelectionChange;
                 Application.WindowBeforeDoubleClick += Application_WindowBeforeDoubleClick;
-                SchedulePreviewWindowPrewarm();
 
-                AddInLog.Write("加载项启动完成。");
+                ScheduleStartupDiagnostics();
+
+                stopwatch.Stop();
+                AddInLog.Write(
+                    "加载项启动完成，Startup 耗时 {0:F1} ms。",
+                    stopwatch.Elapsed.TotalMilliseconds);
             }
             catch (Exception ex)
             {
@@ -50,12 +82,44 @@ namespace WordPictureAddIn
             }
         }
 
+        /// <summary>
+        /// 把环境诊断推迟到 Word 打开完成、界面空闲后再写，避免在启动关键路径上
+        /// 反复跨 COM 读取 Version / Build 并同步写文件。
+        /// </summary>
+        private void ScheduleStartupDiagnostics()
+        {
+            try
+            {
+                var timer = new System.Windows.Forms.Timer
+                {
+                    Interval = StartupDiagnosticsDelayMilliseconds
+                };
+
+                timer.Tick += delegate
+                {
+                    timer.Stop();
+                    timer.Dispose();
+
+                    if (_isShuttingDown || _startupDiagnosticsWritten)
+                    {
+                        return;
+                    }
+
+                    _startupDiagnosticsWritten = true;
+                    WriteStartupDiagnostics();
+                };
+
+                timer.Start();
+            }
+            catch (Exception ex)
+            {
+                AddInLog.Error("安排启动诊断写入失败", ex);
+            }
+        }
+
         /// <summary>把运行环境信息写入日志，便于在目标机上定位加载失败原因。</summary>
         private void WriteStartupDiagnostics()
         {
-            AddInLog.Write("==== 加载项启动 ====");
-            AddInLog.Write("日志文件: {0}", AddInLog.LogFilePath);
-
             try
             {
                 AddInLog.Write("操作系统: {0}", Environment.OSVersion);
@@ -86,12 +150,24 @@ namespace WordPictureAddIn
 
             AddInLog.Write("加载项开始卸载。");
 
-            Application.WindowSelectionChange -= Application_WindowSelectionChange;
-            Application.WindowBeforeDoubleClick -= Application_WindowBeforeDoubleClick;
+            try
+            {
+                Application.WindowSelectionChange -= Application_WindowSelectionChange;
+                Application.WindowBeforeDoubleClick -= Application_WindowBeforeDoubleClick;
+            }
+            catch (Exception ex)
+            {
+                AddInLog.Error("注销事件失败", ex);
+            }
 
             CancelPendingSelectionCapture();
 
-            CloseAllPinWindows();
+            // 只有用过贴图功能才存在管理器，未使用时这里完全不会触达 WPF。
+            if (_pinManager != null)
+            {
+                _pinManager.CloseAll();
+            }
+
             ClearCachedSelectionImage();
         }
 
@@ -116,6 +192,10 @@ namespace WordPictureAddIn
                 // 选中图片时不再同步截图：Word 序列化 WordOpenXML 的开销很大，
                 // 改为延迟防抖后预取，避免每次单击选中都阻塞 Word 界面线程。
                 ScheduleSelectionCapture(selectionKey);
+
+                // 用户已经选中图片，说明很可能会双击贴图：此时才启动 WPF 与贴图窗口预热。
+                // 这一步从 Word 启动阶段移到了这里，启动速度不再受影响。
+                RequestPinManagerPrewarmOnce();
             }
             catch (Exception ex)
             {
@@ -127,25 +207,24 @@ namespace WordPictureAddIn
         {
             _pendingSelectionKey = selectionKey;
 
-            var application = System.Windows.Application.Current;
-            if (application == null)
+            try
             {
-                return;
-            }
-
-            if (_selectionCaptureTimer == null)
-            {
-                _selectionCaptureTimer = new System.Windows.Threading.DispatcherTimer(
-                    System.Windows.Threading.DispatcherPriority.Background,
-                    application.Dispatcher)
+                if (_selectionCaptureTimer == null)
                 {
-                    Interval = TimeSpan.FromMilliseconds(SelectionCaptureDelayMilliseconds)
-                };
-                _selectionCaptureTimer.Tick += SelectionCaptureTimer_Tick;
-            }
+                    _selectionCaptureTimer = new System.Windows.Forms.Timer
+                    {
+                        Interval = SelectionCaptureDelayMilliseconds
+                    };
+                    _selectionCaptureTimer.Tick += SelectionCaptureTimer_Tick;
+                }
 
-            _selectionCaptureTimer.Stop();
-            _selectionCaptureTimer.Start();
+                _selectionCaptureTimer.Stop();
+                _selectionCaptureTimer.Start();
+            }
+            catch (Exception ex)
+            {
+                AddInLog.Error("安排选区抓图失败", ex);
+            }
         }
 
         private void CancelPendingSelectionCapture()
@@ -162,6 +241,11 @@ namespace WordPictureAddIn
         {
             var selectionKey = _pendingSelectionKey;
             CancelPendingSelectionCapture();
+
+            if (_isShuttingDown)
+            {
+                return;
+            }
 
             if (string.IsNullOrEmpty(selectionKey))
             {
@@ -236,11 +320,34 @@ namespace WordPictureAddIn
             }
         }
 
+        /// <summary>
+        /// 判断选区里是否有图片。
+        ///
+        /// 先用 Selection.Type 走快速路径：打开文档、点击正文、敲键盘都会频繁触发
+        /// WindowSelectionChange，而 Selection.InlineShapes / ShapeRange 都是跨进程
+        /// COM 调用，每次都要往返 Word。光标状态（wdSelectionIP）和空选区
+        /// （wdNoSelection）下必然没有图片，直接返回，避免这些无谓的往返。
+        /// 只有拿到类型信息失败时才退回完整检查，确保行为不变。
+        /// </summary>
         private static bool HasSelectedImage(Selection selection)
         {
             if (selection == null)
             {
                 return false;
+            }
+
+            try
+            {
+                var selectionType = selection.Type;
+                if (selectionType == WdSelectionType.wdNoSelection ||
+                    selectionType == WdSelectionType.wdSelectionIP)
+                {
+                    return false;
+                }
+            }
+            catch
+            {
+                // 读取 Type 失败时继续走完整检查，绝不因此漏掉图片。
             }
 
             return selection.InlineShapes.Count > 0 ||
@@ -1082,39 +1189,26 @@ namespace WordPictureAddIn
 
         /// <summary>
         /// 把图片贴到屏幕上。位图所有权移交给新窗口，窗口关闭时自行释放。
+        /// 窗口与 WPF 相关的管理工作全部交给 <see cref="PinManager"/>。
         /// </summary>
         private void ShowPin(Image image)
         {
-            var window = TakeSparePinWindow();
+            GetOrCreatePinManager().ShowPin(image);
+        }
 
-            try
+        /// <summary>
+        /// 取贴图窗口管理器，不存在时创建。
+        /// 这是加载项中唯一会触达 WPF 类型（ImagePreviewWindow）的位置，
+        /// 因此 WPF 程序集的加载被推迟到用户第一次选中图片时。
+        /// </summary>
+        private PinManager GetOrCreatePinManager()
+        {
+            if (_pinManager == null)
             {
-                window.SetImage(image);
-            }
-            catch (Exception ex)
-            {
-                AddInLog.Error("ShowPin 设置图片失败", ex);
-
-                try
-                {
-                    window.Close();
-                }
-                catch (Exception closeEx)
-                {
-                    AddInLog.Error("ShowPin 关闭窗口失败", closeEx);
-                }
-
-                image.Dispose();
-                throw;
+                _pinManager = new PinManager();
             }
 
-            _pinWindows.Add(window);
-
-            window.Show();
-            window.Activate();
-
-            // 空闲时再预热一个备用窗口，保证下一次双击依然能立刻弹出。
-            SchedulePreviewWindowPrewarm();
+            return _pinManager;
         }
 
         /// <summary>
@@ -1162,133 +1256,60 @@ namespace WordPictureAddIn
             _cachedSelectionKey = null;
         }
 
-        private static void EnsureWpfApplication()
+        /// <summary>
+        /// 用户第一次选中图片后，在界面空闲时预热贴图窗口并初始化 WPF 环境。
+        /// 不在 Word 启动阶段做这件事，避免拖慢启动。
+        ///
+        /// 用独立定时器延后触发：WindowSelectionChange 在用户点选图片时同步执行，
+        /// 此刻创建 WPF 环境会让选中操作本身出现卡顿，推迟到消息循环空闲再加载，
+        /// 用户感知不到，而双击贴图时窗口通常已经就绪。
+        /// </summary>
+        private void RequestPinManagerPrewarmOnce()
         {
-            if (System.Windows.Application.Current == null)
+            if (_isShuttingDown || _pinPrewarmRequested)
             {
-                new System.Windows.Application
+                return;
+            }
+
+            _pinPrewarmRequested = true;
+
+            try
+            {
+                var timer = new System.Windows.Forms.Timer
                 {
-                    ShutdownMode = ShutdownMode.OnExplicitShutdown
+                    Interval = PinPrewarmDelayMilliseconds
                 };
+
+                timer.Tick += delegate
+                {
+                    timer.Stop();
+                    timer.Dispose();
+
+                    if (_isShuttingDown)
+                    {
+                        return;
+                    }
+
+                    SchedulePreviewWindowPrewarm();
+                };
+
+                timer.Start();
+            }
+            catch (Exception ex)
+            {
+                AddInLog.Error("安排贴图窗口预热失败", ex);
             }
         }
 
-        /// <summary>
-        /// Word 启动时同步创建 WPF 窗口会拖慢启动速度，改为界面空闲时预热。
-        /// </summary>
+        /// <summary>把预热请求转交给 <see cref="PinManager"/>，由它在 UI 空闲时创建窗口。</summary>
         private void SchedulePreviewWindowPrewarm()
         {
-            var application = System.Windows.Application.Current;
-            if (application == null)
-            {
-                return;
-            }
-
-            application.Dispatcher.BeginInvoke(
-            System.Windows.Threading.DispatcherPriority.ApplicationIdle,
-            new Action(delegate
-            {
-                if (_isShuttingDown)
-                {
-                    return;
-                }
-
-                if (_sparePinWindow != null)
-                {
-                    return;
-                }
-
-                try
-                {
-                    _sparePinWindow = CreatePinWindow();
-                }
-                catch (Exception ex)
-                {
-                    AddInLog.Error("预热贴图窗口失败", ex);
-                }
-            }));
-        }
-
-        private ImagePreviewWindow CreatePinWindow()
-        {
-            var window = new ImagePreviewWindow();
-            window.Closed += PinWindow_Closed;
-            return window;
-        }
-
-        private ImagePreviewWindow TakeSparePinWindow()
-        {
-            var window = _sparePinWindow;
-            if (window != null)
-            {
-                _sparePinWindow = null;
-                return window;
-            }
-
-            return CreatePinWindow();
-        }
-
-        private void PinWindow_Closed(object sender, EventArgs e)
-        {
-            var window = sender as ImagePreviewWindow;
-            if (window == null)
-            {
-                return;
-            }
-
-            window.Closed -= PinWindow_Closed;
-            _pinWindows.Remove(window);
-
-            if (ReferenceEquals(_sparePinWindow, window))
-            {
-                _sparePinWindow = null;
-            }
-
             if (_isShuttingDown)
             {
                 return;
             }
 
-            // 关闭后再次空闲时预热新的备用窗口。
-            SchedulePreviewWindowPrewarm();
-        }
-
-        private void CloseAllPinWindows()
-        {
-            _isShuttingDown = true;
-
-            ImagePreviewWindow spare;
-            while (_pinWindows.Count > 0)
-            {
-                var window = _pinWindows[_pinWindows.Count - 1];
-                _pinWindows.RemoveAt(_pinWindows.Count - 1);
-
-                try
-                {
-                    window.Closed -= PinWindow_Closed;
-                    window.Close();
-                }
-                catch (Exception ex)
-                {
-                    AddInLog.Error("关闭贴图窗口失败", ex);
-                }
-            }
-
-            spare = _sparePinWindow;
-            _sparePinWindow = null;
-
-            if (spare != null)
-            {
-                try
-                {
-                    spare.Closed -= PinWindow_Closed;
-                    spare.Close();
-                }
-                catch (Exception ex)
-                {
-                    AddInLog.Error("关闭备用贴图窗口失败", ex);
-                }
-            }
+            GetOrCreatePinManager().SchedulePreviewWindowPrewarm();
         }
 
         #region VSTO 生成的代码

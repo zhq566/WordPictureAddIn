@@ -59,15 +59,41 @@
 <img width="611" height="234" alt="image" src="https://github.com/user-attachments/assets/659ad924-87c4-45ae-aeb3-22438ef77ed1" />
 
 ### 手动部署（无安装包时）
-使用 [`scripts`](scripts) 目录下的脚本，无需管理员权限：
+使用 [`scripts`](scripts) 目录下的脚本：
 
 ```cmd
-scripts\Register-AddIn.cmd Release     :: 注册（建议分发 Release 编译产物）
-scripts\Diagnose-AddIn.cmd Release     :: 加载失败时先跑这个，只读诊断
+scripts\Register-AddIn.cmd             :: 注册（默认 bin\Release）
+scripts\Diagnose-AddIn.cmd             :: 加载失败或启动慢时先跑这个，只读诊断
 scripts\Unregister-AddIn.cmd           :: 卸载
 ```
 
 注册脚本会自动处理换机器部署最常见的三个坑：解除拷贝文件的「网络来源」锁定、
 写入 VSTO 信任列表（避免自签名证书被拦）、清理 Word 的「禁用项目」记录。
+脚本本身只写 `HKCU`，无需管理员权限；以管理员身份运行时还会额外执行
+NGen 预编译（按 Word 位数自动选择 `Framework` / `Framework64` 的 `ngen.exe`），
+不提升权限则自动跳过，不影响功能。
 
 排查方法详见 [`scripts/README.md`](scripts/README.md)。
+
+## 启动性能
+
+加载项对 Word 启动时间的影响已做如下优化，功能行为不变：
+
+| 优化点 | 说明 |
+|---|---|
+| WPF 延迟加载 | 贴图窗口（WPF）在**首次选中图片**时才初始化，Word 启动时不再加载 PresentationFramework / PresentationCore / WindowsBase |
+| 类型隔离 | WPF 相关字段与方法全部移入 `PinManager`，`ThisAddIn` 不出现 WPF 类型，避免 CLR 在构建类型布局时连带加载 WPF 程序集 |
+| 启动诊断延后 | `WriteStartupDiagnostics` 的若干 COM 调用推迟到启动后 2 秒执行，`ThisAddIn_Startup` 只写一行耗时日志 |
+| 选区事件快速返回 | `WindowSelectionChange` 先用 `selection.Type` 判断，空白选区/光标状态下不再发起 `InlineShapes` / `ShapeRange` 跨进程调用 |
+| 取消启动期预热 | 不再在 `ApplicationIdle` 建隐藏窗口；改为首次选中图片后延迟 400 ms 预热，贴图后与关闭后仍会再预热 |
+| Release + NGen | 默认注册 Release 产物，并以管理员身份执行 `ngen install`，省去启动时的 JIT 编译 |
+
+加载项自身耗时记录在 `%LOCALAPPDATA%\WordPictureAddIn\addin.log`：
+
+- `加载项启动完成，Startup 耗时 xx ms` —— 每次打开 Word 一行
+- `预热贴图窗口完成，耗时 xx ms` —— 首次选中图片后触发，不计入 Word 启动
+
+如 Word 启动仍然很慢，请先运行 `scripts\Diagnose-AddIn.cmd`，其第 6 节会给出
+NGen 本机映像状态、程序集签名状态与 WinTrust 证书吊销检查设置。
+**离线/内网环境下 CRL/OCSP 查询超时是「Word 启动卡十几秒」的常见原因**，
+具体处理方法见 [`scripts/README.md`](scripts/README.md) 的「启动慢排查」。

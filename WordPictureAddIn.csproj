@@ -118,6 +118,11 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
     <DefineConstants>$(DefineConstants);TRACE</DefineConstants>
     <WarningLevel>4</WarningLevel>
+    <!--
+      不生成 XML 序列化程序集：加载项完全不用 XmlSerializer，
+      关掉可减少编译产物、加快程序集加载。
+    -->
+    <GenerateSerializationAssemblies>Off</GenerateSerializationAssemblies>
   </PropertyGroup>
   <!--
     This section specifies references for the project.
@@ -232,6 +237,7 @@
       <DependentUpon>Settings.settings</DependentUpon>
     </Compile>
     <Compile Include="AddInLog.cs" />
+    <Compile Include="PinManager.cs" />
     <Compile Include="ThisAddIn.cs">
       <SubType>Code</SubType>
     </Compile>

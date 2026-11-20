@@ -6,7 +6,8 @@
 .DESCRIPTION
     1. 删除 HKCU\Software\Microsoft\Office\Word\Addins\WordPictureAddIn 注册项。
     2. 删除 HKCU\Software\Microsoft\VSTO\Security\Inclusion 中指向本加载项的信任项。
-    3. 清除非 Office 14/15/16 中 Word 的 DoNotDisableAddinList\WordPictureAddIn。
+    3. 清理 Office 14/15/16 中 Word 的 DoNotDisableAddinList\WordPictureAddIn。
+    4. 从 NGen 本机映像缓存移除加载项（需管理员权限，未提权时自动跳过）。
 
     加 -Force 可跳过 Word 运行中的确认提示。
 
@@ -15,12 +16,23 @@
 
 .PARAMETER KeepTrust
     保留 VSTO 信任列表项（更换版本时想复用证书信任时可指定）。
+
+.PARAMETER Target
+    Release（默认）、Debug，或任意输出目录的绝对/相对路径；用于定位要卸载 NGen 的程序集。
+
+.PARAMETER NoNGen
+    跳过 NGen 缓存清理。
 #>
 [CmdletBinding()]
 param(
     [switch]$Force,
 
-    [switch]$KeepTrust
+    [switch]$KeepTrust,
+
+    [Parameter(Position = 0)]
+    [string]$Target = 'Release',
+
+    [switch]$NoNGen
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,7 +41,27 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $addInName = 'WordPictureAddIn'
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$rootDir   = Split-Path -Parent $scriptDir
 $regKey = "HKCU:\Software\Microsoft\Office\Word\Addins\$addInName"
+
+# NGen 辅助函数（Get-WordPlatform / Uninstall-AddInNGen 等）
+. (Join-Path $scriptDir 'NGen-Common.ps1')
+
+# ---- 解析输出目录（用于定位 NGen 缓存中的程序集） ----
+switch ($Target) {
+    'Release' { $outDir = Join-Path $rootDir 'bin\Release' }
+    'Debug'   { $outDir = Join-Path $rootDir 'bin\Debug' }
+    default {
+        if ([System.IO.Path]::IsPathRooted($Target)) {
+            $outDir = $Target
+        } else {
+            $outDir = Join-Path $rootDir $Target
+        }
+    }
+}
+$outDir = [System.IO.Path]::GetFullPath($outDir).TrimEnd('\')
+$dllPath = Join-Path $outDir "$addInName.dll"
 
 # ---- 检查 Word 是否在运行 ----
 $word = Get-Process -Name 'WINWORD' -ErrorAction SilentlyContinue
@@ -98,6 +130,21 @@ foreach ($version in $resiliencyVersions) {
         } catch {
             Write-Host "[警告] 清理 Word $version DoNotDisableAddinList 失败: $($_.Exception.Message)" -ForegroundColor Yellow
         }
+    }
+}
+
+# ---- 清理 NGen 本机映像缓存 ----
+if ($NoNGen) {
+    Write-Host '[信息] 已按 -NoNGen 跳过 NGen 缓存清理。' -ForegroundColor Gray
+} elseif (-not (Test-IsAdministrator)) {
+    Write-Host '[信息] 当前不是管理员权限，跳过 NGen 缓存清理。' -ForegroundColor Gray
+    Write-Host '       NGen 缓存占用很小，残留不影响使用；如需彻底清理请用管理员身份运行。' -ForegroundColor Gray
+} else {
+    $wordPlatform = Get-WordPlatform
+    if ($wordPlatform) {
+        Uninstall-AddInNGen -AssemblyPath $dllPath -Platform $wordPlatform | Out-Null
+    } else {
+        Write-Host '[信息] 无法确定 Word 位数，跳过 NGen 缓存清理。' -ForegroundColor Gray
     }
 }
 

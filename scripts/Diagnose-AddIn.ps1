@@ -10,14 +10,15 @@
       3. Word 弹性机制（Resiliency\DisabledItems / DoNotDisableAddinList）
       4. VSTO 解决方案元数据中的错误记录（SolutionMetadata）
       5. 环境信息：.NET Framework、VSTO 运行时、Office 版本与位数
-      6. 输出目录文件及其网络来源锁定（Zone.Identifier）状态
-      7. 加载项自身日志（%LOCALAPPDATA%\WordPictureAddIn\addin.log）
+      6. 加载项启动耗时、NGen 本机映像状态、证书吊销检查状态
+      7. 输出目录文件及其网络来源锁定（Zone.Identifier）状态
+      8. 加载项自身日志（%LOCALAPPDATA%\WordPictureAddIn\addin.log）
 
     使用 -EnableAlerts 时会额外把 VSTO 的诊断环境变量写入当前用户，
     让下次启动 Word 时弹出真实错误框并生成 .vsto.log（属修改状态，可选）。
 
 .PARAMETER Target
-    Debug（默认）、Release，或任意输出目录的绝对/相对路径。
+    Release（默认）、Debug，或任意输出目录的绝对/相对路径。
 
 .PARAMETER EnableAlerts
     设置 VSTO_SUPPRESSDISPLAYALERTS=0、VSTO_LOGALERTS=1，使 VSTO 弹出详细错误。
@@ -27,13 +28,13 @@
 
 .EXAMPLE
     .\Diagnose-AddIn.ps1
-    .\Diagnose-AddIn.ps1 Release
+    .\Diagnose-AddIn.ps1 Debug
     .\Diagnose-AddIn.ps1 Release -EnableAlerts
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [string]$Target = 'Debug',
+    [string]$Target = 'Release',
 
     [switch]$EnableAlerts,
 
@@ -402,9 +403,202 @@ if ($wordProcess) {
 
 #endregion
 
-#region ---- 6. 输出目录文件与锁定状态 ----
+#region ---- 6. 加载项启动性能 ----
 
-Write-Section '6. 输出目录文件与网络来源锁定'
+Write-Section '6. 加载项启动性能'
+
+$dllPath = Join-Path $outDir "$addInName.dll"
+$perfLogPath = Join-Path $env:LOCALAPPDATA 'WordPictureAddIn\addin.log'
+$startupAverage = $null
+
+# ---- 6.1 加载项日志中的计时记录 ----
+$startupSamples  = New-Object System.Collections.Generic.List[double]
+$prewarmSamples  = New-Object System.Collections.Generic.List[double]
+
+if (-not (Test-Path -LiteralPath $perfLogPath)) {
+    Write-Note '暂无 addin.log，无法统计启动耗时。'
+} else {
+    $perfLines = Get-Content -LiteralPath $perfLogPath -Tail 600 -ErrorAction SilentlyContinue
+    foreach ($line in $perfLines) {
+        $m = [regex]::Match($line, 'Startup 耗时\s*([0-9]+(?:\.[0-9]+)?)\s*ms')
+        if ($m.Success) {
+            $startupSamples.Add([double]$m.Groups[1].Value)
+            continue
+        }
+        $m2 = [regex]::Match($line, '预热贴图窗口完成，耗时\s*([0-9]+(?:\.[0-9]+)?)\s*ms')
+        if ($m2.Success) { $prewarmSamples.Add([double]$m2.Groups[1].Value) }
+    }
+
+    if ($startupSamples.Count -eq 0) {
+        Write-Note '日志中没有计时记录（可能是升级前写入的旧日志，重启一次 Word 后再看）。'
+    } else {
+        $recent = @($startupSamples | Select-Object -Last 5)
+        $startupAverage = ($recent | Measure-Object -Average).Average
+        $startupMax     = ($recent | Measure-Object -Maximum).Maximum
+        $perfText = '最近 {0} 次 Startup 耗时: 平均 {1:F1} ms，最大 {2:F1} ms' -f $recent.Count, $startupAverage, $startupMax
+
+        if ($startupAverage -le 400) {
+            Write-Ok $perfText
+        } else {
+            Write-Note $perfText
+        }
+
+        if ($startupAverage -gt 1500) {
+            Write-Bad 'Startup 耗时偏高（平均 > 1500 ms）。请结合下面 NGen 与证书吊销检查结论定位原因。'
+        }
+    }
+
+    if ($prewarmSamples.Count -gt 0) {
+        $prewarmAverage = ($prewarmSamples | Measure-Object -Average).Average
+        Write-Note ('贴图窗口预热耗时: 平均 {0:F1} ms（首次选中图片后才触发，不计入 Word 启动时间）' -f $prewarmAverage)
+    } else {
+        Write-Note '尚无贴图窗口预热记录（本次会话还没选中过图片）。'
+    }
+}
+
+# ---- 6.2 Word 记录的加载项加载耗时 ----
+$loadTimeKeys = @()
+foreach ($ver in @('16.0', '15.0', '14.0')) {
+    $loadTimeKeys += "HKCU:\Software\Microsoft\Office\$ver\Word\Addins\$addInName"
+}
+$loadTimeKeys += "HKCU:\Software\Microsoft\Office\Word\Addins\$addInName"
+
+$loadTimeFound = $false
+foreach ($key in $loadTimeKeys) {
+    if (-not (Test-Path -LiteralPath $key)) { continue }
+    $item = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+    if ($null -eq $item) { continue }
+
+    foreach ($prop in $item.PSObject.Properties) {
+        if ($prop.Name -match '(?i)^loadtime') {
+            Write-Host ("  Word 记录的加载耗时: {0} = {1}" -f $prop.Name, $prop.Value)
+            $loadTimeFound = $true
+        }
+    }
+}
+
+if (-not $loadTimeFound) {
+    Write-Note 'Word 尚未记录本加载项的 LoadTime（首次加载后才会写入）。'
+}
+
+# ---- 6.3 NGen 本机映像状态 ----
+$ngenCommonPath = Join-Path $scriptDir 'NGen-Common.ps1'
+$wordPlatform = $null
+
+if (Test-Path -LiteralPath $ngenCommonPath) {
+    try {
+        . $ngenCommonPath
+        $wordPlatform = Get-WordPlatform
+    } catch {
+        Write-Note ('加载 NGen-Common.ps1 失败: {0}' -f $_.Exception.Message)
+    }
+}
+
+if (-not $wordPlatform) {
+    Write-Note '无法确定 Word 的位数，跳过 NGen 状态检查。'
+} else {
+    Write-Host ("  Word 位数 = {0}" -f $wordPlatform)
+    $ngenExe = Get-NGenPath -Platform $wordPlatform
+
+    if (-not $ngenExe) {
+        $frameworkDirName = if ($wordPlatform -eq 'x86') { 'Framework' } else { 'Framework64' }
+        Write-Bad ('未找到 ngen.exe（期望: %WINDIR%\Microsoft.NET\{0}\v4.0.30319\ngen.exe）' -f $frameworkDirName)
+    } else {
+        Write-Host ("  ngen.exe  = {0}" -f $ngenExe)
+
+        if (-not (Test-Path -LiteralPath $dllPath)) {
+            Write-Note ("程序集不存在，无法检查 NGen 状态: {0}" -f $dllPath)
+        } else {
+            $ngenInstalled = $false
+            $ngenChecked = $false
+
+            $previousPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $displayOutput = & $ngenExe display $dllPath /nologo 2>&1
+                $ngenChecked = $true
+                if (($displayOutput -join "`n") -match '(?i)WordPictureAddIn') { $ngenInstalled = $true }
+            } catch {
+            } finally {
+                $ErrorActionPreference = $previousPreference
+            }
+
+            if (-not $ngenChecked) {
+                Write-Note '无法查询 NGen 缓存（可能需要管理员权限）。'
+            } elseif ($ngenInstalled) {
+                Write-Ok '本机映像(NGen)已安装 —— CLR 加载时无需 JIT 编译。'
+                Write-Note '程序集更新后需重新运行 Register-AddIn.ps1 才会刷新映像。'
+            } else {
+                Write-Bad '本机映像(NGen)未安装，Word 启动时需要 JIT 编译加载项。'
+                Write-Note '解决: 以管理员身份运行 scripts\Register-AddIn.ps1（内部会执行 ngen install）。'
+            }
+        }
+    }
+}
+
+if ($Target -eq 'Debug' -or $outDir -match '(?i)[\\/]bin[\\/]debug$') {
+    Write-Bad '当前诊断的是 Debug 配置产物：JIT 不做优化，Word 启动会明显变慢。'
+    Write-Note '日常使用请改用 Release：以管理员身份运行 scripts\Register-AddIn.ps1（默认 Release）。'
+} else {
+    Write-Ok '当前为 Release 配置产物。'
+}
+
+# ---- 6.4 证书签名与吊销检查 ----
+# VSTO 校验的是 .vsto 清单的签名，所以优先检查清单，缺失时再退回检查 dll。
+$signTargets = @(
+    (Join-Path $outDir "$addInName.vsto")
+    $dllPath
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+if ($signTargets.Count -eq 0) {
+    Write-Note '输出目录缺少 .vsto 与 dll，跳过签名检查。'
+} else {
+    $signTarget = $signTargets[0]
+    Write-Host ("  签名对象 = {0}" -f (Split-Path -Leaf $signTarget))
+
+    $signature = $null
+    try { $signature = Get-AuthenticodeSignature -LiteralPath $signTarget -ErrorAction SilentlyContinue } catch { }
+
+    if ($null -eq $signature) {
+        Write-Note '无法读取 Authenticode 签名信息。'
+    } elseif ($null -eq $signature.SignerCertificate) {
+        Write-Ok '未签名 —— 不涉及证书吊销检查，启动不会被 CRL/OCSP 阻塞。'
+    } else {
+        Write-Host ("  签名主体 = {0}" -f $signature.SignerCertificate.Subject)
+        Write-Host ("  签名状态 = {0}" -f $signature.Status)
+
+        if ("$($signature.Status)" -eq 'Valid') {
+            Write-Ok '签名有效，证书吊销检查已完成。'
+        } else {
+            Write-Bad ("签名状态为 {0}：VSTO 可能因证书校验失败或超时而拒绝加载。" -f $signature.Status)
+            Write-Note '内网/离线环境下，CRL/OCSP 查询会一直等到超时，是 Word 启动卡顿十几秒的常见原因。'
+        }
+    }
+}
+
+$wintrustKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\WinTrust\Trust Providers\Software Publishing'
+$wintrustState = Get-FirstPropertyValue -Paths @($wintrustKey) -Names @('State')
+
+if ($null -eq $wintrustState) {
+    Write-Note '未读取到 WinTrust 吊销检查设置（使用系统默认值 0x23E00）。'
+} else {
+    $stateValue = 0
+    [void][int]::TryParse("$wintrustState", [ref]$stateValue)
+
+    if ($stateValue -eq 0x23C00) {
+        Write-Bad '证书吊销检查已被关闭（State = 0x23C00）：启动会更快，但不再校验证书是否被吊销。'
+        Write-Note ('恢复默认: Set-ItemProperty -Path "{0}" -Name State -Value 0x23E00' -f $wintrustKey)
+    } else {
+        Write-Note ('WinTrust State = 0x{0:X}（默认 0x23E00 表示启用证书吊销检查）。' -f $stateValue)
+        Write-Note '若内网/离线环境启动卡顿十几秒，可临时设为 0x23C00 对比验证（属降低安全性，排查后请恢复）。'
+    }
+}
+
+#endregion
+
+#region ---- 7. 输出目录文件与锁定状态 ----
+
+Write-Section '7. 输出目录文件与网络来源锁定'
 
 if (-not (Test-Path -LiteralPath $outDir)) {
     Write-Bad "输出目录不存在: $outDir"
@@ -446,14 +640,14 @@ if (-not (Test-Path -LiteralPath $outDir)) {
 
 #endregion
 
-#region ---- 7. 加载项自身日志 ----
+#region ---- 8. 加载项自身日志 ----
 
-Write-Section '7. 加载项自身日志'
+Write-Section '8. 加载项自身日志'
 
 $logPath = Join-Path $env:LOCALAPPDATA 'WordPictureAddIn\addin.log'
 if (-not (Test-Path -LiteralPath $logPath)) {
     Write-Note "日志不存在: $logPath"
-    Write-Note '说明加载项从未成功启动过；请重点检查上面 1~6 项。'
+    Write-Note '说明加载项从未成功启动过；请重点检查上面 1~7 项。'
 } else {
     $logInfo = Get-Item -LiteralPath $logPath
     Write-Host ("  路径      = {0}" -f $logPath)
@@ -469,9 +663,9 @@ if (-not (Test-Path -LiteralPath $logPath)) {
 
 #endregion
 
-#region ---- 8. 可选：开启 VSTO 详细错误提示 ----
+#region ---- 9. 可选：开启 VSTO 详细错误提示 ----
 
-Write-Section '8. VSTO 错误提示开关'
+Write-Section '9. VSTO 错误提示开关'
 
 if ($EnableAlerts -and $DisableAlerts) {
     Write-Bad '不能同时使用 -EnableAlerts 与 -DisableAlerts，已跳过。'
@@ -510,6 +704,9 @@ Write-Host ('=' * 72) -ForegroundColor DarkGray
 Write-Host ' 诊断完成。' -ForegroundColor Cyan
 if ($disabledFound) {
     Write-Host ' 结论: 加载项曾被 Word 自动禁用，请先运行 Register-AddIn.ps1 清理禁用记录。' -ForegroundColor Yellow
+}
+if ($null -ne $startupAverage -and $startupAverage -gt 1500) {
+    Write-Host (' 结论: Startup 平均耗时 {0:F0} ms，明显偏高；请按第 6 节提示安装 NGen 并检查证书吊销检查。' -f $startupAverage) -ForegroundColor Yellow
 }
 Write-Host ('=' * 72) -ForegroundColor DarkGray
 Write-Host ''

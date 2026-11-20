@@ -1,7 +1,7 @@
 ﻿#requires -Version 3.0
 <#
 .SYNOPSIS
-    注册 WordPictureAddIn（VSTO Word 加载项），无需管理员权限。
+    注册 WordPictureAddIn（VSTO Word 加载项）。
 
 .DESCRIPTION
     1. 对输出目录下所有文件递归解除 Windows 文件锁定（Zone.Identifier）。
@@ -14,9 +14,12 @@
     4. 清理 Office 14/15/16 中 Word 的「禁用项目」记录（Resiliency\DisabledItems），
        并写入 DoNotDisableAddinList，防止加载项被 Word 自动禁用。
     5. 检测 .NET Framework / VSTO 运行时 / Office 版本与位数，低于支持范围时明确提示。
+    6. NGen 预编译加载项程序集，减少 Word 启动时的 JIT 开销（需管理员权限，可选）。
+
+    默认使用 Release 输出：Release 开启了代码优化，启动明显快于 Debug。
 
 .PARAMETER Target
-    Debug（默认）、Release，或任意输出目录的绝对/相对路径。
+    Release（默认）、Debug，或任意输出目录的绝对/相对路径。
 
 .PARAMETER NoTrust
     跳过写入 VSTO 信任列表（HKCU\Software\Microsoft\VSTO\Security\Inclusion）。
@@ -24,19 +27,26 @@
 .PARAMETER NoResiliency
     跳过清理 Word 弹性机制（DisabledItems / DoNotDisableAddinList）。
 
+.PARAMETER NoNGen
+    跳过 NGen 预编译。默认会尝试执行，但只在当前进程具备管理员权限时才真正生效；
+    没有管理员权限时会给出提示而不是报错。
+
 .EXAMPLE
     .\Register-AddIn.ps1
     .\Register-AddIn.ps1 Release
-    .\Register-AddIn.ps1 "D:\build\bin\Debug"
+    .\Register-AddIn.ps1 Debug -NoNGen
+    .\Register-AddIn.ps1 "D:\build\bin\Release"
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [string]$Target = 'Debug',
+    [string]$Target = 'Release',
 
     [switch]$NoTrust,
 
-    [switch]$NoResiliency
+    [switch]$NoResiliency,
+
+    [switch]$NoNGen
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +57,9 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $addInName = 'WordPictureAddIn'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $rootDir   = Split-Path -Parent $scriptDir
+
+# NGen 辅助函数（Get-WordPlatform / Install-AddInNGen 等）
+. (Join-Path $scriptDir 'NGen-Common.ps1')
 
 #region ---- 工具函数 ----
 
@@ -94,8 +107,8 @@ function Get-FirstPropertyValue {
 #region ---- 解析输出目录 ----
 
 switch ($Target) {
-    'Debug'   { $outDir = Join-Path $rootDir 'bin\Debug' }
     'Release' { $outDir = Join-Path $rootDir 'bin\Release' }
+    'Debug'   { $outDir = Join-Path $rootDir 'bin\Debug' }
     default {
         if ([System.IO.Path]::IsPathRooted($Target)) {
             $outDir = $Target
@@ -406,6 +419,26 @@ if ($NoResiliency) {
 
 #endregion
 
+#region ---- NGen 预编译（加速 Word 启动） ----
+
+if ($NoNGen) {
+    Write-Host '[信息] 已按 -NoNGen 跳过 NGen 预编译（加载项首次加载会稍慢，功能不受影响）。' -ForegroundColor Gray
+} else {
+    $wordPlatform = Get-WordPlatform
+    if (-not $wordPlatform) {
+        Write-Warn '无法确定 Word 是 32 位还是 64 位，跳过 NGen 预编译。'
+        Write-Warn 'NGen 必须与 Word 位数匹配，猜测错误等于没装。可手动执行：ngen install <dll>'
+    } elseif (-not (Test-IsAdministrator)) {
+        Write-Warn '当前不是管理员权限，跳过 NGen 预编译。'
+        Write-Warn '如需进一步加快 Word 启动，请用管理员身份重新运行本脚本，或手动执行：'
+        Write-Warn ("  `"$(Get-NGenPath -Platform $wordPlatform)`" install `"$dllPath`"")
+    } else {
+        Install-AddInNGen -AssemblyPath $dllPath -Platform $wordPlatform | Out-Null
+    }
+}
+
+#endregion
+
 #region ---- 回读校验 ----
 
 $check = Get-ItemProperty -Path $regKey
@@ -426,6 +459,9 @@ Write-Host '       后续步骤:' -ForegroundColor Gray
 Write-Host '         1) 完全关闭所有 Word 窗口（含后台残留 WINWORD.EXE），再重新打开 Word' -ForegroundColor Gray
 Write-Host '         2) 若仍未加载，运行 scripts\Diagnose-AddIn.ps1 查看具体原因' -ForegroundColor Gray
 Write-Host '         3) 手动排查: 文件 -> 选项 -> 加载项 -> 管理:禁用的项目' -ForegroundColor Gray
+Write-Host '       启动耗时说明:' -ForegroundColor Gray
+Write-Host '         - 日志 %LOCALAPPDATA%\WordPictureAddIn\addin.log 记录了 Startup 耗时与预热耗时' -ForegroundColor Gray
+Write-Host '         - 更新过加载项 DLL 后需重新运行本脚本，NGen 缓存才会刷新' -ForegroundColor Gray
 
 #endregion
 
